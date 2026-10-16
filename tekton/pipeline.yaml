@@ -1,0 +1,40 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: vm-provision
+  namespace: vm-provisioning
+spec:
+  description: Create one to five VMs from the approved native Template.
+  params:
+    - name: vm-name
+      type: string
+      description: Unused VM name or batch base name
+    - name: size
+      type: string
+      description: small, medium, or large
+    - name: count
+      type: string
+      default: "1"
+      description: Number of VMs (1-5); batches have numbered suffixes
+    - name: ssh-public-key
+      type: string
+      description: OpenSSH ed25519 public key
+  workspaces:
+    - name: scratch
+  tasks:
+    - name: provision
+      taskRef:
+        kind: Task
+        name: vm-provision
+      params:
+        - name: vm-name
+          value: $(params.vm-name)
+        - name: size
+          value: $(params.size)
+        - name: count
+          value: $(params.count)
+        - name: ssh-public-key
+          value: $(params.ssh-public-key)
+      workspaces:
+        - name: scratch
+          workspace: scratch

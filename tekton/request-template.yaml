@@ -1,0 +1,56 @@
+# Install separately. Instantiating the catalog entry starts real provisioning.
+# Use the vm-provisioning project; the processor supplies the object's namespace.
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: vm-provision-request
+  namespace: vm-provisioning
+  annotations:
+    openshift.io/display-name: Request RHEL VM
+    description: >-
+      Request one to five RHEL VMs. Size: small, medium, or large. Count: 1-5.
+      Name must be unused. Counts above 1 add numbered suffixes.
+      SSH key must be an ed25519 public key. Creates a real PipelineRun.
+    tags: rhel,vm,virtualization,request,pipeline
+    iconClass: icon-rhel
+objects:
+  - apiVersion: tekton.dev/v1
+    kind: PipelineRun
+    metadata:
+      name: vm-request-${VM_NAME}
+    spec:
+      pipelineRef:
+        name: vm-provision
+      taskRunTemplate:
+        serviceAccountName: vm-provision
+      workspaces:
+        - name: scratch
+          emptyDir: {}
+      params:
+        - name: vm-name
+          value: ${VM_NAME}
+        - name: size
+          value: ${SIZE}
+        - name: count
+          value: ${COUNT}
+        - name: ssh-public-key
+          value: ${SSH_PUBLIC_KEY}
+parameters:
+  - name: VM_NAME
+    displayName: VM name
+    description: Unused VM name or batch base name; lowercase letters, digits, hyphens.
+    required: true
+  - name: SIZE
+    displayName: Size
+    description: small, medium, or large
+    value: small
+    required: true
+  - name: COUNT
+    displayName: Count
+    description: Number of identical VMs (1-5)
+    value: "1"
+    required: true
+  - name: SSH_PUBLIC_KEY
+    displayName: SSH public key
+    description: An OpenSSH ed25519 public key, not a private key
+    required: true

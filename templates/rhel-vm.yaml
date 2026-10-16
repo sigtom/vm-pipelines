@@ -1,0 +1,140 @@
+# Native VM definition processed by oc. Does not create anything on installation.
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: rhel-standard
+  namespace: vm-provisioning
+  labels:
+    app.kubernetes.io/part-of: vm-pipelines
+parameters:
+  - name: VM_NAME
+    required: true
+  - name: VM_NAMESPACE
+    required: true
+  - name: VM_SIZE
+    required: true
+  - name: INSTANCE_TYPE
+    required: true
+  - name: DISK_SIZE
+    required: true
+  - name: STORAGE_CLASS
+    required: true
+  - name: ACCESS_MODE
+    required: true
+  - name: VOLUME_MODE
+    required: true
+  - name: DATASOURCE_NAME
+    required: true
+  - name: DATASOURCE_NAMESPACE
+    required: true
+  - name: NETWORK_ATTACHMENT
+    required: true
+  - name: MAC_ADDRESS
+    required: true
+  - name: IP_CIDR
+    required: true
+  - name: GATEWAY
+    required: true
+  - name: DNS_SERVERS
+    required: true
+  - name: DOMAIN
+    required: true
+  - name: GUEST_USER
+    value: cloud-user
+  - name: SUDO_POLICY
+    value: "false"
+  - name: SSH_PUBLIC_KEY
+    required: true
+objects:
+  - apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    metadata:
+      name: ${VM_NAME}
+      namespace: ${VM_NAMESPACE}
+      labels:
+        app.kubernetes.io/managed-by: tekton-vm-provision
+        app.kubernetes.io/part-of: vm-pipelines
+        vm-pipelines/size: ${VM_SIZE}
+        vm-pipelines/os: rhel
+    spec:
+      runStrategy: Always
+      instancetype:
+        kind: VirtualMachineInstancetype
+        name: ${INSTANCE_TYPE}
+      dataVolumeTemplates:
+        - metadata:
+            name: ${VM_NAME}-root
+          spec:
+            sourceRef:
+              kind: DataSource
+              name: ${DATASOURCE_NAME}
+              namespace: ${DATASOURCE_NAMESPACE}
+            storage:
+              storageClassName: ${STORAGE_CLASS}
+              accessModes:
+                - ${ACCESS_MODE}
+              volumeMode: ${VOLUME_MODE}
+              resources:
+                requests:
+                  storage: ${DISK_SIZE}
+      template:
+        metadata:
+          labels:
+            kubevirt.io/domain: ${VM_NAME}
+        spec:
+          terminationGracePeriodSeconds: 180
+          domain:
+            devices:
+              disks:
+                - name: rootdisk
+                  disk:
+                    bus: virtio
+                - name: cloudinitdisk
+                  disk:
+                    bus: virtio
+              interfaces:
+                - name: lan
+                  bridge: {}
+                  macAddress: "${MAC_ADDRESS}"
+          networks:
+            - name: lan
+              multus:
+                networkName: ${NETWORK_ATTACHMENT}
+          volumes:
+            - name: rootdisk
+              dataVolume:
+                name: ${VM_NAME}-root
+            - name: cloudinitdisk
+              cloudInitNoCloud:
+                userData: |
+                  #cloud-config
+                  hostname: ${VM_NAME}
+                  fqdn: ${VM_NAME}.${DOMAIN}
+                  manage_etc_hosts: true
+                  ssh_pwauth: false
+                  disable_root: true
+                  users:
+                    - name: ${GUEST_USER}
+                      lock_passwd: true
+                      groups: wheel
+                      sudo: ${SUDO_POLICY}
+                      ssh_authorized_keys:
+                        - |-
+                          ${SSH_PUBLIC_KEY}
+                  # Salt bootstrap remains disabled until customer approval.
+                networkData: |
+                  version: 2
+                  ethernets:
+                    lan:
+                      match:
+                        macaddress: "${MAC_ADDRESS}"
+                      set-name: eth0
+                      addresses:
+                        - ${IP_CIDR}
+                      routes:
+                        - to: 0.0.0.0/0
+                          via: ${GATEWAY}
+                      nameservers:
+                        addresses: [${DNS_SERVERS}]
+                        search:
+                          - ${DOMAIN}

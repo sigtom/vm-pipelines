@@ -1,0 +1,23 @@
+# Example only. Creating this object starts real provisioning.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: vm-request-
+  namespace: vm-provisioning
+spec:
+  pipelineRef:
+    name: vm-provision
+  taskRunTemplate:
+    serviceAccountName: vm-provision
+  workspaces:
+    - name: scratch
+      emptyDir: {}
+  params:
+    - name: vm-name
+      value: REPLACE_ME_UNUSED_VM_NAME
+    - name: size
+      value: small
+    - name: count
+      value: "1"
+    - name: ssh-public-key
+      value: REPLACE_ME_REAL_SSH_PUBLIC_KEY

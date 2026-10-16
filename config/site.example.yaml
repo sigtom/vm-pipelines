@@ -1,0 +1,35 @@
+# Copy to site.yaml (gitignored). All values are strings; NO credentials here.
+# Namespace, RBAC, and image references must match; see docs/runbook.md.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vm-provision-config
+  namespace: vm-provisioning
+data:
+  VM_NAMESPACE: vm-provisioning
+  NETWORK_ATTACHMENT: REPLACE_ME_EXISTING_NAD
+  DATASOURCE_NAME: REPLACE_ME_APPROVED_DATASOURCE
+  DATASOURCE_NAMESPACE: openshift-virtualization-os-images
+  STORAGE_CLASS: REPLACE_ME_STORAGECLASS
+  ACCESS_MODE: REPLACE_ME_ACCESS_MODE         # ReadWriteOnce or ReadWriteMany
+  VOLUME_MODE: REPLACE_ME_VOLUME_MODE         # Filesystem or Block
+  GUEST_USER: cloud-user
+  CLOUD_USER_SUDO: "false"                   # Or explicitly approved ALL=(ALL) NOPASSWD:ALL
+  IPAM_URL: https://REPLACE_ME_INFOBLOX_HOST  # Origin only; no /wapi path
+  INFOBLOX_WAPI_VERSION: REPLACE_ME_WAPI_VERSION  # E.g. 2.12; verify appliance version
+  INFOBLOX_NETWORK: REPLACE_ME_IPV4_CIDR
+  INFOBLOX_DNS_VIEW: REPLACE_ME_DNS_VIEW
+  INFOBLOX_NETWORK_VIEW: REPLACE_ME_NETWORK_VIEW
+  STATIC_START: REPLACE_ME_FIRST_APPROVED_STATIC_IP
+  STATIC_END: REPLACE_ME_LAST_APPROVED_STATIC_IP
+  GATEWAY: REPLACE_ME_GATEWAY
+  DNS_SERVERS: REPLACE_ME_DNS_IPS             # IPv4 addresses separated by commas
+  DOMAIN: REPLACE_ME_DNS_SEARCH_DOMAIN
+  DHCP_START: REPLACE_ME_FIRST_DHCP_IP
+  DHCP_END: REPLACE_ME_LAST_DHCP_IP
+  # If DHCP is absent, remove BOTH range keys above and change this to "true".
+  DHCP_DISABLED: "false"
+  # Optional proxy settings for runtime containers; cluster proxy is not assumed.
+  # HTTPS_PROXY: http://proxy.example.com:3128
+  # HTTP_PROXY: http://proxy.example.com:3128
+  # NO_PROXY: .svc,.cluster.local,REPLACE_ME_INTERNAL_ENDPOINTS

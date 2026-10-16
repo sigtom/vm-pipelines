@@ -1,0 +1,29 @@
+# Manual binary build. No Git credentials or automatic build triggers.
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: vm-ipam
+  namespace: vm-provisioning
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: vm-ipam
+  namespace: vm-provisioning
+spec:
+  runPolicy: Serial
+  source:
+    type: Binary
+    binary: {}
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Containerfile
+      buildArgs:
+        - name: BASE_IMAGE
+          value: REPLACE_ME_UBI_PYTHON_IMAGE_BY_DIGEST
+  output:
+    to:
+      kind: ImageStreamTag
+      name: vm-ipam:0.1
+  triggers: []

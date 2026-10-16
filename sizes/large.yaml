@@ -1,0 +1,12 @@
+apiVersion: instancetype.kubevirt.io/v1beta1
+kind: VirtualMachineInstancetype
+metadata:
+  name: poc-large
+  namespace: vm-provisioning
+  labels:
+    app.kubernetes.io/part-of: vm-pipelines
+spec:
+  cpu:
+    guest: 8
+  memory:
+    guest: 16Gi

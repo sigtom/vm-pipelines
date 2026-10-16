@@ -1,0 +1,206 @@
+# One shared Task; credentials are injected only into reserve-ip.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: vm-provision
+  namespace: vm-provisioning
+spec:
+  params:
+    - name: vm-name
+      type: string
+    - name: size
+      type: string
+    - name: count
+      type: string
+    - name: ssh-public-key
+      type: string
+    # ADMIN-ONLY image settings: change defaults before applying the Task.
+    # These are not exposed by the Pipeline or catalog request form.
+    - name: cli-image
+      type: string
+      default: REPLACE_ME_CLI_IMAGE_BY_DIGEST
+    - name: ipam-image
+      type: string
+      default: REPLACE_ME_BUILT_IPAM_IMAGE_BY_DIGEST
+  workspaces:
+    - name: scratch
+  stepTemplate:
+    env:
+      - name: HOME
+        value: /tmp
+      - name: DOCKER_CONFIG
+        value: /tmp/.docker
+    workingDir: $(workspaces.scratch.path)
+    securityContext:
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
+  steps:
+    - name: validate-key
+      image: $(params.ipam-image)
+      env:
+        - name: REQ_SSH_KEY
+          value: $(params.ssh-public-key)
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        python3 /opt/vm/ipam.py check-ssh-key
+    - name: preflight
+      image: $(params.cli-image)
+      envFrom:
+        - configMapRef:
+            name: vm-provision-config
+      env:
+        - name: REQ_NAME
+          value: $(params.vm-name)
+        - name: REQ_SIZE
+          value: $(params.size)
+        - name: REQ_COUNT
+          value: $(params.count)
+        - name: SCRATCH
+          value: $(workspaces.scratch.path)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        fail() { echo "ERROR: $*" >&2; exit 1; }
+        case "$REQ_SIZE" in
+          small) DISK_SIZE=40Gi ;;
+          medium) DISK_SIZE=80Gi ;;
+          large) DISK_SIZE=160Gi ;;
+          *) fail "size must be small, medium, or large" ;;
+        esac
+        case "$REQ_COUNT" in
+          1|2|3|4|5) ;;
+          *) fail "count must be between 1 and 5" ;;
+        esac
+        [[ "$REQ_NAME" =~ ^[a-z][a-z0-9-]{0,54}[a-z0-9]$ ]] || fail "invalid VM name"
+        for setting in VM_NAMESPACE NETWORK_ATTACHMENT DATASOURCE_NAME DATASOURCE_NAMESPACE STORAGE_CLASS ACCESS_MODE VOLUME_MODE GUEST_USER IPAM_URL; do
+          [[ -n "${!setting:-}" && "${!setting}" != *REPLACE_ME* ]] || fail "missing site setting: $setting"
+        done
+        case "$ACCESS_MODE" in ReadWriteOnce|ReadWriteMany) ;; *) fail "unsupported ACCESS_MODE" ;; esac
+        case "$VOLUME_MODE" in Filesystem|Block) ;; *) fail "unsupported VOLUME_MODE" ;; esac
+        [[ "$GUEST_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || fail "invalid GUEST_USER"
+        case "${CLOUD_USER_SUDO:-false}" in
+          false|'ALL=(ALL) NOPASSWD:ALL') ;;
+          *) fail "unsupported CLOUD_USER_SUDO policy" ;;
+        esac
+        # Only an empty successful GET is 'not found'; authorization failures abort.
+        exists() {
+          local found
+          found=$(oc -n "$1" get "$2" "$3" --ignore-not-found -o name) \
+            || fail "cannot read $2 $3 in $1"
+          [[ -n "$found" ]] || fail "$2 $3 not found in $1"
+        }
+        can_i() {
+          local args=("$2" "$3" -n "$1") answer
+          [[ -z "${4:-}" ]] || args+=("--subresource=$4")
+          answer=$(oc auth can-i "${args[@]}") || true
+          [[ "$answer" == yes ]] || fail "ServiceAccount may not $2 $3 ${4:-} in $1"
+        }
+        bytes() {
+          [[ "$1" =~ ^([0-9]{1,12})(Ki|Mi|Gi|Ti)?$ ]] || return 1
+          local n=$((10#${BASH_REMATCH[1]}))
+          case "${BASH_REMATCH[2]}" in
+            Ki) echo $((n * 1024)) ;; Mi) echo $((n * 1048576)) ;;
+            Gi) echo $((n * 1073741824)) ;; Ti) echo $((n * 1099511627776)) ;;
+            *) echo "$n" ;;
+          esac
+        }
+        exists "$VM_NAMESPACE" templates.template.openshift.io rhel-standard
+        exists "$VM_NAMESPACE" virtualmachineinstancetypes.instancetype.kubevirt.io "poc-$REQ_SIZE"
+        exists "$VM_NAMESPACE" network-attachment-definitions.k8s.cni.cncf.io "$NETWORK_ATTACHMENT"
+        can_i "$VM_NAMESPACE" create virtualmachines.kubevirt.io
+        source=$(oc -n "$DATASOURCE_NAMESPACE" get datasources.cdi.kubevirt.io "$DATASOURCE_NAME" \
+          --ignore-not-found \
+          -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}|{.status.source.pvc.name}|{.status.source.pvc.namespace}') \
+          || fail "cannot read DataSource $DATASOURCE_NAME"
+        [[ -n "$source" ]] || fail "DataSource not found"
+        IFS='|' read -r ready pvc_name pvc_ns <<< "$source"
+        pvc_ns=${pvc_ns:-$DATASOURCE_NAMESPACE}
+        [[ "$ready" == True && -n "$pvc_name" ]] || fail "DataSource is not Ready or has no source PVC"
+        pvc=$(oc -n "$pvc_ns" get persistentvolumeclaims "$pvc_name" --ignore-not-found \
+          -o 'jsonpath={.status.phase}|{.spec.storageClassName}|{.spec.volumeMode}|{.status.capacity.storage}') \
+          || fail "cannot read source PVC $pvc_name in $pvc_ns"
+        [[ -n "$pvc" ]] || fail "source PVC not found"
+        IFS='|' read -r phase src_class src_mode src_size <<< "$pvc"
+        [[ "$phase" == Bound ]] || fail "source PVC is not Bound"
+        # Deliberately conservative MVP guard: not a general CDI limitation.
+        [[ "$src_class" == "$STORAGE_CLASS" && "$src_mode" == "$VOLUME_MODE" ]] \
+          || fail "source storage class/volume mode differs from approved target"
+        src_bytes=$(bytes "$src_size") || fail "unrecognised source PVC capacity"
+        disk_bytes=$(bytes "$DISK_SIZE")
+        (( src_bytes <= disk_bytes )) || fail "source PVC is larger than target disk"
+        can_i "$pvc_ns" create datavolumes.cdi.kubevirt.io source
+        names=""
+        for ((i=1; i<=REQ_COUNT; i++)); do
+          name="$REQ_NAME"
+          if (( REQ_COUNT > 1 )); then printf -v name '%s-%03d' "$REQ_NAME" "$i"; fi
+          found=$(oc -n "$VM_NAMESPACE" get virtualmachines.kubevirt.io "$name" --ignore-not-found -o name) \
+            || fail "cannot read VM $name"
+          [[ -z "$found" ]] || fail "VM $name already exists. No IP allocated."
+          for kind in datavolumes.cdi.kubevirt.io persistentvolumeclaims; do
+            found=$(oc -n "$VM_NAMESPACE" get "$kind" "$name-root" --ignore-not-found -o name) \
+              || fail "cannot read $kind $name-root"
+            [[ -z "$found" ]] || fail "$kind $name-root already exists. No IP allocated."
+          done
+          names+="$name"$'\n'
+        done
+        printf '%s' "$names" > "$SCRATCH/names"
+        printf '%s\n' "$DISK_SIZE" > "$SCRATCH/disk-size"
+        echo "Preflight passed; no IPAM changes yet."
+    - name: reserve-ip
+      image: $(params.ipam-image)
+      envFrom:
+        - configMapRef:
+            name: vm-provision-config
+        - secretRef:
+            name: vm-ipam-credentials
+      env:
+        - name: VM_NAMES_FILE
+          value: $(workspaces.scratch.path)/names
+        - name: ALLOCATIONS_FILE
+          value: $(workspaces.scratch.path)/allocations
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        umask 077
+        python3 /opt/vm/ipam.py
+    - name: create-vms
+      image: $(params.cli-image)
+      envFrom:
+        - configMapRef:
+            name: vm-provision-config
+      env:
+        - name: REQ_SIZE
+          value: $(params.size)
+        - name: REQ_SSH_KEY
+          value: $(params.ssh-public-key)
+        - name: SCRATCH
+          value: $(workspaces.scratch.path)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        disk=$(< "$SCRATCH/disk-size")
+        oc -n "$VM_NAMESPACE" get templates.template.openshift.io rhel-standard -o yaml > "$SCRATCH/template.yaml"
+        [[ -s "$SCRATCH/allocations" ]] || { echo "No allocation receipt" >&2; exit 1; }
+        while IFS='|' read -r name address mac gateway dns domain; do
+          [[ -n "$name" && -n "$address" ]] || { echo "Invalid allocation receipt" >&2; exit 1; }
+          oc process --local -f "$SCRATCH/template.yaml" -o yaml \
+            -p "VM_NAME=$name" -p "VM_NAMESPACE=$VM_NAMESPACE" \
+            -p "VM_SIZE=$REQ_SIZE" -p "INSTANCE_TYPE=poc-$REQ_SIZE" \
+            -p "DISK_SIZE=$disk" -p "STORAGE_CLASS=$STORAGE_CLASS" \
+            -p "ACCESS_MODE=$ACCESS_MODE" -p "VOLUME_MODE=$VOLUME_MODE" \
+            -p "DATASOURCE_NAME=$DATASOURCE_NAME" -p "DATASOURCE_NAMESPACE=$DATASOURCE_NAMESPACE" \
+            -p "NETWORK_ATTACHMENT=$NETWORK_ATTACHMENT" -p "GUEST_USER=$GUEST_USER" \
+            -p "SUDO_POLICY=${CLOUD_USER_SUDO:-false}" -p "MAC_ADDRESS=$mac" \
+            -p "IP_CIDR=$address" -p "GATEWAY=$gateway" \
+            -p "DNS_SERVERS=$dns" -p "DOMAIN=$domain" -p "SSH_PUBLIC_KEY=$REQ_SSH_KEY" \
+            > "$SCRATCH/$name.yaml"
+          if ! oc -n "$VM_NAMESPACE" create -f "$SCRATCH/$name.yaml"; then
+            echo "FAILED: reservations remain. Inspect $name and reconcile before retrying." >&2
+            exit 1
+          fi
+        done < "$SCRATCH/allocations"
