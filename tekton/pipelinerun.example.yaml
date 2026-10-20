@@ -21,3 +21,6 @@ spec:
       value: "1"
     - name: ssh-public-key
       value: REPLACE_ME_REAL_SSH_PUBLIC_KEY
+    # Optional; leave empty or supply e.g. "foo=bar;boo=far".
+    - name: vm-labels
+      value: ""

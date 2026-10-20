@@ -99,7 +99,7 @@ Set the two **administrator-only Task parameter defaults** in `tekton/task.yaml`
   registry usually uses `image-registry.openshift-image-registry.svc:5000`, but
   use the actual verified output reference.
 
-No image parameters appear in the four-field request form. Scan both images
+No image parameters appear in the request form. Scan both images
 using the customer's approved process. Builds on another architecture need a
 matching base/CLI image. For offline environments, mirror those images first;
 there are no Python wheels to mirror for runtime.
@@ -157,10 +157,11 @@ workflow under the customer's installed product versions.
 
 Open **Ecosystem -> Software Catalog -> Request RHEL VM -> Instantiate Template**
 in `vm-provisioning`. Name and public key are required; size defaults to small,
-count to 1. Fields are text, not promised dropdowns. ServiceAccount `vm-provision`
-and workspace `scratch: emptyDir` are fixed. After Create, track PipelineRuns;
-Topology may be the initial redirect. The explicit alternative is
-`tekton/pipelinerun.example.yaml`, with the same execution identity.
+count to 1, and additional VM labels to empty. Fields are text, not promised
+dropdowns. ServiceAccount `vm-provision` and workspace `scratch: emptyDir` are
+fixed. After Create, track PipelineRuns; Topology may be the initial redirect.
+The explicit alternative is `tekton/pipelinerun.example.yaml`, with the same
+execution identity.
 
 Count 1 uses the name unchanged; counts 2-5 append `-001`, `-002`, etc.
 The catalog uses `vm-request-<name>` for its PipelineRun name, so resubmitting the
@@ -168,6 +169,41 @@ same name is rejected. This is not a recovery mechanism. Begin with one VM and
 verify runtime permissions, SCC/image pulls, one IP reservation, CDI clone,
 VM Ready, cloud-init, DNS and SSH. Test batch/failure scenarios separately.
 **Creating the VM resource is not a guest-ready or hardening-complete signal.**
+
+### Additional VM labels
+
+The fifth form field, **Additional VM labels**, is optional. Enter semicolon-
+separated pairs, for example `foo=bar;boo=far`. CLI callers use the optional
+Pipeline parameter `vm-labels`, which defaults to `""` for existing callers.
+The catalog request Template calls the same parameter `VM_LABELS`.
+
+- A blank field adds no labels. Whitespace around entries, keys and values is trimmed.
+- Keys and values must satisfy Kubernetes label syntax. Qualified keys such as
+  `example.com/team=ops` and empty values such as `reviewed=` are supported.
+- Duplicate keys, missing `=`, empty entries (including a trailing `;`), invalid
+  characters/lengths, and any key already present on the approved VM Template
+  fail in preflight, before the IPAM step. This protects standard ownership,
+  size and OS labels, as well as labels administrators add to the Template.
+- The same labels are applied to **VM `metadata.labels`** for every VM in a batch.
+  They are not added to the PipelineRun, VMI template, DataVolume or PVC.
+
+The Task passes input through an environment variable, never interpolates it
+into executable shell text, and stores canonical label arguments in the scratch
+workspace. `oc label --local --overwrite=false` merges them into each rendered
+VM immediately before `oc create`. No live patch permission, additional helper,
+package or image rebuild is needed. A late label conflict stops creation and
+leaves any reservations for deliberate reconciliation, as with other failures.
+
+To roll out this change, preserve the approved image defaults and namespace
+settings, then update the Task, Pipeline and request Template together. Do not
+apply the sample PipelineRun merely to update the form. Existing VMs remain
+unchanged. Validate an approved new VM with `oc get vm <name> --show-labels`;
+the offline tests already exercise native form rendering and the real local
+label command without allocating an IP or contacting a cluster.
+
+Labels may select backup or other automation policies. This remains a trusted-
+operator interface; agree on allowed business labels before broader access.
+Kubernetes syntax reference: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
 
 ## 6. Failure handling and guest ownership
 

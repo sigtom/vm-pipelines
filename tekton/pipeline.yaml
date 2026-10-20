@@ -19,6 +19,10 @@ spec:
     - name: ssh-public-key
       type: string
       description: OpenSSH ed25519 public key
+    - name: vm-labels
+      type: string
+      default: ""
+      description: "Optional VM labels separated by semicolons, e.g. foo=bar;boo=far. Applied to every VM in the request."
   workspaces:
     - name: scratch
   tasks:
@@ -35,6 +39,8 @@ spec:
           value: $(params.count)
         - name: ssh-public-key
           value: $(params.ssh-public-key)
+        - name: vm-labels
+          value: $(params.vm-labels)
       workspaces:
         - name: scratch
           workspace: scratch

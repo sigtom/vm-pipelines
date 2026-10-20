@@ -10,7 +10,8 @@ metadata:
     description: >-
       Request one to five RHEL VMs. Size: small, medium, or large. Count: 1-5.
       Name must be unused. Counts above 1 add numbered suffixes.
-      SSH key must be an ed25519 public key. Creates a real PipelineRun.
+      SSH key must be an ed25519 public key. Additional VM labels are optional.
+      Creates a real PipelineRun.
     tags: rhel,vm,virtualization,request,pipeline
     iconClass: icon-rhel
 objects:
@@ -35,6 +36,8 @@ objects:
           value: ${COUNT}
         - name: ssh-public-key
           value: ${SSH_PUBLIC_KEY}
+        - name: vm-labels
+          value: ${VM_LABELS}
 parameters:
   - name: VM_NAME
     displayName: VM name
@@ -54,3 +57,8 @@ parameters:
     displayName: SSH public key
     description: An OpenSSH ed25519 public key, not a private key
     required: true
+  - name: VM_LABELS
+    displayName: Additional VM labels
+    description: "Optional. Separate labels with semicolons: foo=bar;boo=far. Applied to all VMs in this request. Template-managed labels cannot be replaced."
+    value: ""
+    required: false

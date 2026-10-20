@@ -14,6 +14,10 @@ spec:
       type: string
     - name: ssh-public-key
       type: string
+    - name: vm-labels
+      type: string
+      default: ""
+      description: Optional semicolon-separated key=value labels for VM metadata.
     # ADMIN-ONLY image settings: change defaults before applying the Task.
     # These are not exposed by the Pipeline or catalog request form.
     - name: cli-image
@@ -60,11 +64,14 @@ spec:
           value: $(params.size)
         - name: REQ_COUNT
           value: $(params.count)
+        - name: REQ_LABELS
+          value: $(params.vm-labels)
         - name: SCRATCH
           value: $(workspaces.scratch.path)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
+        export LC_ALL=C
         fail() { echo "ERROR: $*" >&2; exit 1; }
         case "$REQ_SIZE" in
           small) DISK_SIZE=40Gi ;;
@@ -87,6 +94,41 @@ spec:
           false|'ALL=(ALL) NOPASSWD:ALL') ;;
           *) fail "unsupported CLOUD_USER_SUDO policy" ;;
         esac
+
+        # Parse labels as data, never shell code. Reject invalid input before IPAM.
+        trim() {
+          local s=$1
+          s="${s#"${s%%[![:space:]]*}"}"
+          s="${s%"${s##*[![:space:]]}"}"
+          printf '%s' "$s"
+        }
+        labels=()
+        declare -A label_keys=()
+        raw_labels=${REQ_LABELS:-}
+        [[ "$raw_labels" != *$'\n'* && "$raw_labels" != *$'\r'* ]] || fail "labels must be one line"
+        raw_labels=$(trim "$raw_labels")
+        if [[ -n "$raw_labels" ]]; then
+          [[ "$raw_labels" != ';'* && "$raw_labels" != *';' ]] || fail "empty label entry"
+          IFS=';' read -r -a entries <<< "$raw_labels"
+          label_pattern='^[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$'
+          prefix_pattern='^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+          for entry in "${entries[@]}"; do
+            [[ "$entry" == *=* ]] || fail "each label must be key=value"
+            key=$(trim "${entry%%=*}")
+            value=$(trim "${entry#*=}")
+            name=${key##*/}
+            [[ ${#name} -le 63 && "$name" =~ $label_pattern ]] || fail "invalid label key"
+            if [[ "$key" == */* ]]; then
+              prefix=${key%/*}
+              [[ ${#prefix} -le 253 && "$prefix" =~ $prefix_pattern ]] || fail "invalid label prefix"
+            fi
+            [[ ${#value} -le 63 && ( -z "$value" || "$value" =~ $label_pattern ) ]] || fail "invalid label value"
+            [[ -z "${label_keys[$key]+set}" ]] || fail "duplicate label key: $key"
+            label_keys["$key"]=1
+            labels+=("$key=$value")
+          done
+        fi
+
         # Only an empty successful GET is 'not found'; authorization failures abort.
         exists() {
           local found
@@ -110,6 +152,17 @@ spec:
           esac
         }
         exists "$VM_NAMESPACE" templates.template.openshift.io rhel-standard
+        if (( ${#labels[@]} )); then
+          # Protect all labels already owned by the approved VM Template, not just
+          # today's four defaults. This read happens before any IPAM allocation.
+          managed=$(oc -n "$VM_NAMESPACE" get templates.template.openshift.io rhel-standard \
+            -o go-template='{{range .objects}}{{if eq .kind "VirtualMachine"}}{{range $key, $value := .metadata.labels}}{{$key}}{{"\n"}}{{end}}{{end}}{{end}}') \
+            || fail "cannot read Template-managed labels"
+          while IFS= read -r key; do
+            [[ -n "$key" ]] || continue
+            [[ -z "${label_keys[$key]+set}" ]] || fail "label $key is managed by the VM Template"
+          done <<< "$managed"
+        fi
         exists "$VM_NAMESPACE" virtualmachineinstancetypes.instancetype.kubevirt.io "poc-$REQ_SIZE"
         exists "$VM_NAMESPACE" network-attachment-definitions.k8s.cni.cncf.io "$NETWORK_ATTACHMENT"
         can_i "$VM_NAMESPACE" create virtualmachines.kubevirt.io
@@ -148,6 +201,9 @@ spec:
           done
           names+="$name"$'\n'
         done
+        # Canonical label arguments are read by create-vms, not reparsed from input.
+        : > "$SCRATCH/labels"
+        if (( ${#labels[@]} )); then printf '%s\n' "${labels[@]}" > "$SCRATCH/labels"; fi
         printf '%s' "$names" > "$SCRATCH/names"
         printf '%s\n' "$DISK_SIZE" > "$SCRATCH/disk-size"
         echo "Preflight passed; no IPAM changes yet."
@@ -184,6 +240,7 @@ spec:
         #!/usr/bin/env bash
         set -euo pipefail
         disk=$(< "$SCRATCH/disk-size")
+        mapfile -t labels < "$SCRATCH/labels"
         oc -n "$VM_NAMESPACE" get templates.template.openshift.io rhel-standard -o yaml > "$SCRATCH/template.yaml"
         [[ -s "$SCRATCH/allocations" ]] || { echo "No allocation receipt" >&2; exit 1; }
         while IFS='|' read -r name address mac gateway dns domain; do
@@ -199,6 +256,16 @@ spec:
             -p "IP_CIDR=$address" -p "GATEWAY=$gateway" \
             -p "DNS_SERVERS=$dns" -p "DOMAIN=$domain" -p "SSH_PUBLIC_KEY=$REQ_SSH_KEY" \
             > "$SCRATCH/$name.yaml"
+          if (( ${#labels[@]} )); then
+            # Local metadata edit: labels exist at creation, no live patch or RBAC change.
+            # Never overwrite a Template label, including one added since preflight.
+            if ! oc label --local --overwrite=false -f "$SCRATCH/$name.yaml" \
+              -o yaml -- "${labels[@]}" > "$SCRATCH/$name.labeled.yaml"; then
+              echo "FAILED: cannot add VM labels; reservations remain. Reconcile before retrying." >&2
+              exit 1
+            fi
+            mv "$SCRATCH/$name.labeled.yaml" "$SCRATCH/$name.yaml"
+          fi
           if ! oc -n "$VM_NAMESPACE" create -f "$SCRATCH/$name.yaml"; then
             echo "FAILED: reservations remain. Inspect $name and reconcile before retrying." >&2
             exit 1
