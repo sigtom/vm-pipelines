@@ -1,5 +1,4 @@
-# Install separately. Instantiating the catalog entry starts real provisioning.
-# Use the vm-provisioning project; the processor supplies the object's namespace.
+# Install separately. Instantiating this Template starts real provisioning.
 apiVersion: template.openshift.io/v1
 kind: Template
 metadata:
@@ -8,10 +7,9 @@ metadata:
   annotations:
     openshift.io/display-name: Request RHEL VM
     description: >-
-      Request one to five RHEL VMs. Size: small, medium, or large. Count: 1-5.
-      Name must be unused. Counts above 1 add numbered suffixes.
-      SSH key must be an ed25519 public key. Additional VM labels are optional.
-      Creates a real PipelineRun.
+      Request one to five RHEL VMs through AAP network allocation and Tekton.
+      Size: small, medium, or large. Count: 1-5. Names must be unused.
+      Optional VM labels: foo=bar;boo=far. Creates a real PipelineRun.
     tags: rhel,vm,virtualization,request,pipeline
     iconClass: icon-rhel
 objects:
@@ -22,6 +20,8 @@ objects:
     spec:
       pipelineRef:
         name: vm-provision
+      timeouts:
+        pipeline: 65m
       taskRunTemplate:
         serviceAccountName: vm-provision
       workspaces:
@@ -58,7 +58,6 @@ parameters:
     description: An OpenSSH ed25519 public key, not a private key
     required: true
   - name: VM_LABELS
-    displayName: Additional VM labels
-    description: "Optional. Separate labels with semicolons: foo=bar;boo=far. Applied to all VMs in this request. Template-managed labels cannot be replaced."
+    displayName: Additional VM labels (optional)
+    description: "Semicolon-separated key=value pairs, for example foo=bar;boo=far. Applied to every VM in this request."
     value: ""
-    required: false

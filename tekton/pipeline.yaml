@@ -4,7 +4,7 @@ metadata:
   name: vm-provision
   namespace: vm-provisioning
 spec:
-  description: Create one to five VMs from the approved native Template.
+  description: Request networking from AAP, then create one to five VMs from the native Template.
   params:
     - name: vm-name
       type: string
@@ -22,11 +22,12 @@ spec:
     - name: vm-labels
       type: string
       default: ""
-      description: "Optional VM labels separated by semicolons, e.g. foo=bar;boo=far. Applied to every VM in the request."
+      description: Optional semicolon-separated key=value labels for VM metadata.
   workspaces:
     - name: scratch
   tasks:
     - name: provision
+      timeout: 60m
       taskRef:
         kind: Task
         name: vm-provision
@@ -41,6 +42,9 @@ spec:
           value: $(params.ssh-public-key)
         - name: vm-labels
           value: $(params.vm-labels)
+        # Correlation only, not a user input or an automatic retry mechanism.
+        - name: request-id
+          value: $(context.pipelineRun.uid)
       workspaces:
         - name: scratch
           workspace: scratch

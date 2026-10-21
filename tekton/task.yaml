@@ -1,4 +1,4 @@
-# One shared Task; credentials are injected only into reserve-ip.
+# One shared Task; the AAP token is injected only into reserve-ip.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -18,8 +18,10 @@ spec:
       type: string
       default: ""
       description: Optional semicolon-separated key=value labels for VM metadata.
+    - name: request-id
+      type: string
+      description: Internal PipelineRun UID, supplied by the Pipeline; not a form input.
     # ADMIN-ONLY image settings: change defaults before applying the Task.
-    # These are not exposed by the Pipeline or catalog request form.
     - name: cli-image
       type: string
       default: REPLACE_ME_CLI_IMAGE_BY_DIGEST
@@ -28,6 +30,11 @@ spec:
       default: REPLACE_ME_BUILT_IPAM_IMAGE_BY_DIGEST
   workspaces:
     - name: scratch
+  volumes:
+    - name: aap-ca
+      configMap:
+        name: vm-aap-ca
+        optional: true
   stepTemplate:
     env:
       - name: HOME
@@ -84,7 +91,7 @@ spec:
           *) fail "count must be between 1 and 5" ;;
         esac
         [[ "$REQ_NAME" =~ ^[a-z][a-z0-9-]{0,54}[a-z0-9]$ ]] || fail "invalid VM name"
-        for setting in VM_NAMESPACE NETWORK_ATTACHMENT DATASOURCE_NAME DATASOURCE_NAMESPACE STORAGE_CLASS ACCESS_MODE VOLUME_MODE GUEST_USER IPAM_URL; do
+        for setting in VM_NAMESPACE NETWORK_ATTACHMENT DATASOURCE_NAME DATASOURCE_NAMESPACE STORAGE_CLASS ACCESS_MODE VOLUME_MODE GUEST_USER AAP_API_BASE_URL; do
           [[ -n "${!setting:-}" && "${!setting}" != *REPLACE_ME* ]] || fail "missing site setting: $setting"
         done
         case "$ACCESS_MODE" in ReadWriteOnce|ReadWriteMany) ;; *) fail "unsupported ACCESS_MODE" ;; esac
@@ -95,7 +102,7 @@ spec:
           *) fail "unsupported CLOUD_USER_SUDO policy" ;;
         esac
 
-        # Parse labels as data, never shell code. Reject invalid input before IPAM.
+        # Parse labels as data, never shell code. Reject invalid input before AAP.
         trim() {
           local s=$1
           s="${s#"${s%%[![:space:]]*}"}"
@@ -153,8 +160,7 @@ spec:
         }
         exists "$VM_NAMESPACE" templates.template.openshift.io rhel-standard
         if (( ${#labels[@]} )); then
-          # Protect all labels already owned by the approved VM Template, not just
-          # today's four defaults. This read happens before any IPAM allocation.
+          # Protect all labels owned by the approved VM Template before AAP allocation.
           managed=$(oc -n "$VM_NAMESPACE" get templates.template.openshift.io rhel-standard \
             -o go-template='{{range .objects}}{{if eq .kind "VirtualMachine"}}{{range $key, $value := .metadata.labels}}{{$key}}{{"\n"}}{{end}}{{end}}{{end}}') \
             || fail "cannot read Template-managed labels"
@@ -201,20 +207,25 @@ spec:
           done
           names+="$name"$'\n'
         done
-        # Canonical label arguments are read by create-vms, not reparsed from input.
         : > "$SCRATCH/labels"
         if (( ${#labels[@]} )); then printf '%s\n' "${labels[@]}" > "$SCRATCH/labels"; fi
         printf '%s' "$names" > "$SCRATCH/names"
         printf '%s\n' "$DISK_SIZE" > "$SCRATCH/disk-size"
-        echo "Preflight passed; no IPAM changes yet."
+        echo "Preflight passed; no AAP jobs launched yet."
     - name: reserve-ip
       image: $(params.ipam-image)
+      volumeMounts:
+        - name: aap-ca
+          mountPath: /etc/aap-ca
+          readOnly: true
       envFrom:
         - configMapRef:
             name: vm-provision-config
         - secretRef:
-            name: vm-ipam-credentials
+            name: vm-aap-credentials
       env:
+        - name: REQUEST_ID
+          value: $(params.request-id)
         - name: VM_NAMES_FILE
           value: $(workspaces.scratch.path)/names
         - name: ALLOCATIONS_FILE
@@ -223,6 +234,9 @@ spec:
         #!/usr/bin/env sh
         set -eu
         umask 077
+        if [ -f /etc/aap-ca/ca-bundle.crt ]; then
+          export SSL_CERT_FILE=/etc/aap-ca/ca-bundle.crt
+        fi
         python3 /opt/vm/ipam.py
     - name: create-vms
       image: $(params.cli-image)
@@ -257,8 +271,7 @@ spec:
             -p "DNS_SERVERS=$dns" -p "DOMAIN=$domain" -p "SSH_PUBLIC_KEY=$REQ_SSH_KEY" \
             > "$SCRATCH/$name.yaml"
           if (( ${#labels[@]} )); then
-            # Local metadata edit: labels exist at creation, no live patch or RBAC change.
-            # Never overwrite a Template label, including one added since preflight.
+            # Local metadata edit: no live patch or RBAC change.
             if ! oc label --local --overwrite=false -f "$SCRATCH/$name.yaml" \
               -o yaml -- "${labels[@]}" > "$SCRATCH/$name.labeled.yaml"; then
               echo "FAILED: cannot add VM labels; reservations remain. Reconcile before retrying." >&2

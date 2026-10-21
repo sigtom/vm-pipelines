@@ -1,5 +1,4 @@
-# Copy to site.yaml (gitignored). All values are strings; NO credentials here.
-# Namespace, RBAC, and image references must match; see docs/runbook.md.
+# Copy to site.yaml (gitignored). Strings only; no credentials.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -14,22 +13,16 @@ data:
   ACCESS_MODE: REPLACE_ME_ACCESS_MODE         # ReadWriteOnce or ReadWriteMany
   VOLUME_MODE: REPLACE_ME_VOLUME_MODE         # Filesystem or Block
   GUEST_USER: cloud-user
-  CLOUD_USER_SUDO: "false"                   # Or explicitly approved ALL=(ALL) NOPASSWD:ALL
-  IPAM_URL: https://REPLACE_ME_INFOBLOX_HOST  # Origin only; no /wapi path
-  INFOBLOX_WAPI_VERSION: REPLACE_ME_WAPI_VERSION  # E.g. 2.12; verify appliance version
-  INFOBLOX_NETWORK: REPLACE_ME_IPV4_CIDR
-  INFOBLOX_DNS_VIEW: REPLACE_ME_DNS_VIEW
-  INFOBLOX_NETWORK_VIEW: REPLACE_ME_NETWORK_VIEW
-  STATIC_START: REPLACE_ME_FIRST_APPROVED_STATIC_IP
-  STATIC_END: REPLACE_ME_LAST_APPROVED_STATIC_IP
-  GATEWAY: REPLACE_ME_GATEWAY
-  DNS_SERVERS: REPLACE_ME_DNS_IPS             # IPv4 addresses separated by commas
-  DOMAIN: REPLACE_ME_DNS_SEARCH_DOMAIN
-  DHCP_START: REPLACE_ME_FIRST_DHCP_IP
-  DHCP_END: REPLACE_ME_LAST_DHCP_IP
-  # If DHCP is absent, remove BOTH range keys above and change this to "true".
-  DHCP_DISABLED: "false"
-  # Optional proxy settings for runtime containers; cluster proxy is not assumed.
+  CLOUD_USER_SUDO: "false"                   # Customer approval required for NOPASSWD
+  # Full controller API base. Older direct controller installations use /api/v2.
+  AAP_API_BASE_URL: https://REPLACE_ME_AAP_HOST/api/controller/v2
+  AAP_JOB_TEMPLATE_ID: REPLACE_ME_NUMERIC_JOB_TEMPLATE_ID
+  NETWORK_PROFILE: REPLACE_ME_APPROVED_NETWORK_PROFILE
+  AAP_JOB_TIMEOUT_SECONDS: "600"             # Per VM; includes queue/run/read-back
+  AAP_POLL_INTERVAL_SECONDS: "5"
+  # Gateway/DNS/domain/pool/views are owned by AAP, not copied here.
+  # NETWORK_PROFILE must map to the same network as NETWORK_ATTACHMENT.
+  # Optional runtime proxy settings (cluster proxy is not inherited automatically):
   # HTTPS_PROXY: http://proxy.example.com:3128
   # HTTP_PROXY: http://proxy.example.com:3128
   # NO_PROXY: .svc,.cluster.local,REPLACE_ME_INTERNAL_ENDPOINTS

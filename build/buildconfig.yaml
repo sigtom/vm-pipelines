@@ -25,5 +25,5 @@ spec:
   output:
     to:
       kind: ImageStreamTag
-      name: vm-ipam:0.1
+      name: vm-ipam:0.2
   triggers: []
