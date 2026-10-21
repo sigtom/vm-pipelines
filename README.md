@@ -1,28 +1,27 @@
 # VM Pipelines
 
-Native OpenShift VM templates and Tekton provisioning with **AAP-owned IPAM/DNS**.
-Tekton calls one AAP job per VM; only AAP talks to Infoblox. No direct Infoblox
-credentials or WAPI calls remain in the pipeline.
+**Tekton calls Infoblox NIOS directly. No AAP service, token, job template, or
+network-allocation playbook is required.**
+
+The operator supplies a VM name, size, count, SSH public key, and optional
+semicolon-separated labels. Tekton reserves addresses in Infoblox, processes
+the native OpenShift VM Template, and creates VMs through the Kubernetes API.
+Individual VMs are not written to Git or reconciled by Argo CD.
 
 ```text
-Catalog form: name / size / count / SSH key / optional labels
-  -> validate request and OpenShift dependencies
-  -> AAP job: reserve IP, associate MAC, register and verify DNS
-  -> successful job artifacts.vm_network
+Software Catalog request
+  -> validate -> OpenShift preflight -> direct Infoblox WAPI allocation
   -> oc process + oc label --local + oc create
-  -> CDI disk clone -> cloud-init -> VM
+  -> CDI disk clone -> guest cloud-init
 ```
 
-**Start here:** [Client installation runbook](docs/runbook.md).
-**Give the AAP team:** [Input/output contract and set_stats task](docs/aap-contract.md).
+**Helper release `vm-ipam:0.3` restores direct Infoblox.** The earlier `0.2`
+image contained the AAP caller and must not be reused. Build `0.3` in the target
+cluster and pin its new digest in the Task. See the
+[runbook](docs/runbook.md#switching-from-the-02-image) for the safe update path.
+This is a new commit, not a force-push or history rewrite.
 
-This is a reference implementation for OpenShift Virtualization 4.21+ and
-OpenShift Pipelines serving `tekton.dev/v1`, not a turnkey production service.
-The AAP integration is tested offline, not against your controller, playbook,
-Infoblox appliance, or virtualization cluster. Install the resources after
-review; do not submit requests until AAP and the client configuration are ready.
-
-## What is unchanged
+## Scope
 
 | Size | vCPU | Memory | Root disk |
 | --- | ---: | ---: | ---: |
@@ -30,78 +29,85 @@ review; do not submit requests until AAP and the client configuration are ready.
 | medium | 4 | 8 GiB | 80 GiB |
 | large | 8 | 16 GiB | 160 GiB |
 
-Native instance types, one approved boot source, one bridged NIC, static IPv4,
-requests for 1-5 VMs, SSH ed25519 access, and optional VM labels remain.
-Individual VMs are not committed to Git or reconciled by Argo CD.
-Guest Salt/AD/subscription/security-agent configuration is still customer-owned.
-No custom VM generator, callback service, Ansible installation in Tekton, or
-extra runtime Python packages are required.
+- Native OpenShift VM Template and VirtualMachineInstancetype resources.
+- One approved RHEL DataSource, one bridged NIC and one approved network profile.
+- Static IPv4 allocation and DNS host-record creation in Infoblox NIOS.
+- Requests for 1-5 VMs; sequential allocation and creation, no automatic retries.
+- SSH ed25519 public-key access; no new passwordless sudo rule by default.
+- Optional VM labels, unchanged from the direct-Infoblox baseline.
 
-## Client settings
+**Reference implementation, not a turnkey production service.** Target OpenShift
+Virtualization 4.21+ and Pipelines serving `tekton.dev/v1`. The client must verify
+its installed versions, network, image, storage, permissions and Infoblox API.
+Offline tests do not establish successful integration with a client appliance.
 
-Copy `config/site.example.yaml` to ignored `site.yaml`. Fill all `REPLACE_ME`
-values. Keep OpenShift namespace, image, storage and network settings there.
-The network attachment and AAP network profile must identify the same network.
+The helper is restored from the direct-WAPI implementation. It does not discover
+gateway/DNS/pool settings automatically; administrators supply them in the site
+ConfigMap. It creates DNS host records, not DHCP fixed-address reservations.
+The generated MAC configures the guest NIC; it is not registered for DHCP in
+Infoblox by this implementation. Multi-NIC and automatic guest hardening are
+outside the current scope.
 
-| Setting | Required value |
+## Client configuration
+
+Start with **[docs/runbook.md](docs/runbook.md)**. Copy `config/site.example.yaml`
+to ignored `site.yaml` and fill the `REPLACE_ME` values. Never commit real client
+settings or credentials to this public repository.
+
+| File or resource | Purpose |
 | --- | --- |
-| `AAP_API_BASE_URL` | HTTPS controller base ending `/api/controller/v2` or `/api/v2`. |
-| `AAP_JOB_TEMPLATE_ID` | Numeric ID of an unattended regular job template (no slicing). |
-| `NETWORK_PROFILE` | Approved identifier understood by the AAP playbook. |
-| `AAP_JOB_TIMEOUT_SECONDS` | Per-VM queue/run/read-back deadline; default 600. |
-| `AAP_POLL_INTERVAL_SECONDS` | Status polling interval; default 5. |
-| Secret `vm-aap-credentials` | Key `AAP_TOKEN`, supplied outside Git. |
-| Optional ConfigMap `vm-aap-ca` | Key `ca-bundle.crt` for the approved AAP CA bundle. |
+| `config/site.example.yaml` | OpenShift resources, Infoblox endpoint/version/views, network/pool, gateway, DNS and domain. |
+| `build/buildconfig.yaml` | Approved UBI Python base digest and in-cluster helper build, output `vm-ipam:0.3`. |
+| `tekton/task.yaml` | Administrator-selected CLI and newly built helper image digests. |
+| `tekton/serviceaccount.yaml` | Scoped VM/dependency permissions and source-image access. |
+| Secret `vm-ipam-credentials` | `INFOBLOX_USERNAME` and `INFOBLOX_PASSWORD`; supplied outside Git. |
+| Optional ConfigMap `vm-ipam-ca` | Approved PEM trust bundle under `ca-bundle.crt`. |
 
-Gateway, DNS, domain, address pool and Infoblox policy belong to AAP. AAP returns
-the assigned **`ip_cidr`**, such as `192.0.2.40/24`; Tekton uses that exact value.
-`artifacts.vm_network` is this project's agreed contract, not an automatic AAP
-result. The playbook team must implement and publish it using `set_stats`.
+The default target/execution namespace is `vm-provisioning`. The NAD and IPAM
+subnet must match. No private prebuilt image, runtime Git checkout, Ansible,
+SDK, or runtime pip install is required. The Python helper uses the standard
+library. VM sizing, native Template processing, labels, cloud-init and day-2
+console operations remain unchanged.
 
-Build the helper inside the client cluster using `Containerfile` and
-`build/buildconfig.yaml`, then set tested image **digests** in the Task's
-`cli-image` and `ipam-image` defaults. The existing `vm-ipam` image name/script
-path are retained to avoid needless renaming; tag `0.2` contains the AAP caller.
+## Operator path
 
-## Request form and labels
-
-After separate installation of `tekton/request-template.yaml`:
+Install the request Template separately, then use:
 
 **Project vm-provisioning -> Ecosystem -> Software Catalog -> Request RHEL VM
 -> Instantiate Template -> name / size / count / SSH key / optional labels.**
 
-Labels use `foo=bar;boo=far`. Empty input is valid. Spaces around entries are
-trimmed; invalid/duplicate keys and Template-managed labels are rejected before
-AAP launches. Labels apply to every VM's `metadata.labels` before creation,
-not merely to the PipelineRun, VMI or disk. Existing requests without labels work.
-
 The request fixes the Pipeline, dedicated `vm-provision` ServiceAccount and
-`scratch: emptyDir`. Track progress in Pipelines -> PipelineRuns; the console may
-redirect to Topology. Use trusted platform operators only. Hidden fields are not
-an authorization boundary; arbitrary TaskRun/Pod creation can expose Secrets.
-Validate non-admin and client-console behavior separately.
+`scratch: emptyDir`. Follow progress in Pipelines -> PipelineRuns; the console
+may redirect to Topology. Verify client-console and non-admin access separately.
+Use trusted platform operators only. Hidden fields are not an authorization
+boundary, and arbitrary Pod/TaskRun rights can expose namespace credentials.
 
-## Tests and limits
+### Additional VM labels
+
+Use `foo=bar;boo=far`, or leave the field empty. The Pipeline parameter is
+`vm-labels` and defaults to empty. Spaces around entries are trimmed. Invalid
+Kubernetes labels, duplicate keys, empty entries and attempts to replace
+Template-managed labels fail before IP allocation. Empty values (`key=`) are
+valid; trailing semicolons are not.
+
+Labels are placed on every VM's `metadata.labels` before creation, not on the
+VMI, disks, or PipelineRun. Native `oc label --local --overwrite=false` performs
+the edit. Existing VMs are not changed. No new label helper or RBAC is needed.
+
+## Validation and operations
 
 ```sh
-python3 -m pip install PyYAML==6.0.3  # Test-only dependency
+python3 -m pip install PyYAML==6.0.3  # Tests only, not a runtime dependency.
 python3 -m unittest discover -s tests -v
 python3 -S -m unittest discover -s tests -p test_ipam.py -v
 ```
 
-CI installs the 4.21 `oc` client and requires native rendering tests. AAP tests
-mock the API; native tests process real Templates and labels without a cluster.
-No test allocates a live address. `check-aap` performs GET-only readiness checks;
-see the runbook for an in-cluster check before any provisioning request.
+CI requires the 4.21 oc CLI for real native rendering, label application and
+Kustomize tests. IPAM requests are mocked; tests never allocate live addresses.
+No automatic rollback, retries or deletes are performed. A failed request may
+have left IPAM allocations; retain logs and reconcile before another request.
 
-The helper records request/MAC/job IDs before and after launching. It never
-relaunches, cancels jobs, or deletes allocations automatically. A timeout does
-not imply AAP stopped. Preserve logs and reconcile failures before retrying.
-The request ID is correlation, not built-in idempotency; the playbook must
-handle duplicate/conflicting records safely.
-
-**Upgrade from the direct Infoblox version:** rebuild the helper, replace the
-site settings and Secret reference, and apply the Task, Pipeline and request
-Template together. Do not mix the new Task with the old image. See the runbook.
-VM creation success is not guest readiness: verify CDI, boot, cloud-init, DNS,
-SSH and any customer hardening separately.
+**Pipeline success means VM resources were created, not that guests are ready.**
+Verify CDI, boot, cloud-init, DNS and SSH separately. Subscriptions, AD, Salt and
+security-agent enrollment remain customer-owned integrations. Existing VMware
+golden images can be reused after preparation; see [golden-image.md](docs/golden-image.md).

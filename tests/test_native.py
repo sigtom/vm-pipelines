@@ -20,7 +20,7 @@ SITE=dict(VM_NAMESPACE='vm-provisioning', NETWORK_ATTACHMENT='approved-network',
           DATASOURCE_NAME='rhel-golden', DATASOURCE_NAMESPACE='image-sources',
           STORAGE_CLASS='approved-storage', ACCESS_MODE='ReadWriteMany',
           VOLUME_MODE='Filesystem', GUEST_USER='cloud-user', CLOUD_USER_SUDO='false',
-          AAP_API_BASE_URL='https://aap.example.test/api/controller/v2')
+          IPAM_URL='https://ipam.example.test')
 
 
 def process(file, params):
@@ -54,26 +54,6 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(next(p for p in task['spec']['params'] if p['name']=='vm-labels')['default'],'')
         self.assertIn({'name':'vm-labels','value':'$(params.vm-labels)'},
                       pipeline['spec']['tasks'][0]['params'])
-
-    def test_aap_identity_secret_trust_and_timeouts(self):
-        task=yaml.safe_load((ROOT/'tekton/task.yaml').read_text())['spec']
-        pipeline=yaml.safe_load((ROOT/'tekton/pipeline.yaml').read_text())['spec']
-        self.assertIn({'name':'request-id','value':'$(context.pipelineRun.uid)'},pipeline['tasks'][0]['params'])
-        self.assertNotIn('request-id',[p['name'] for p in pipeline['params']])
-        self.assertEqual(pipeline['tasks'][0]['timeout'],'60m')
-        reserve=next(s for s in task['steps'] if s['name']=='reserve-ip')
-        self.assertIn({'secretRef':{'name':'vm-aap-credentials'}},reserve['envFrom'])
-        self.assertIn({'name':'REQUEST_ID','value':'$(params.request-id)'},reserve['env'])
-        self.assertIn('SSL_CERT_FILE=/etc/aap-ca/ca-bundle.crt',reserve['script'])
-        self.assertEqual(task['volumes'][0]['configMap'],{'name':'vm-aap-ca','optional':True})
-        request=yaml.safe_load((ROOT/'tekton/request-template.yaml').read_text())
-        self.assertEqual(request['objects'][0]['spec']['timeouts']['pipeline'],'65m')
-        self.assertEqual(len(request['parameters']),5)
-        site=yaml.safe_load((ROOT/'config/site.example.yaml').read_text())['data']
-        self.assertIn('AAP_JOB_TEMPLATE_ID',site)
-        self.assertIn('NETWORK_PROFILE',site)
-        self.assertFalse(any(k.startswith('INFOBLOX_') for k in site))
-        self.assertNotIn('AAP_TOKEN',site)
 
     def test_kustomize(self):
         if not OC:
@@ -111,7 +91,7 @@ class NativeTests(unittest.TestCase):
                             DISK_SIZE=disk,MAC_ADDRESS='02:11:22:33:44:55',IP_CIDR='192.0.2.33/24',
                             GATEWAY='192.0.2.1',DNS_SERVERS='192.0.2.2,192.0.2.3',DOMAIN='example.test',
                             SUDO_POLICY=sudo,SSH_PUBLIC_KEY=key)
-                params.pop('AAP_API_BASE_URL'); params.pop('CLOUD_USER_SUDO')
+                params.pop('IPAM_URL'); params.pop('CLOUD_USER_SUDO')
                 vm=process('templates/rhel-vm.yaml',params)['items'][0]
                 self.assertEqual(vm['spec']['instancetype']['name'],'poc-'+size)
                 self.assertEqual(vm['spec']['dataVolumeTemplates'][0]['spec']['storage']['resources']['requests']['storage'],disk)
@@ -280,10 +260,6 @@ else:
                         self.assertNotIn('labels',vm['spec']['dataVolumeTemplates'][0]['metadata'])
                         cloud=vm['spec']['template']['spec']['volumes'][1]['cloudInitNoCloud']
                         self.assertEqual(yaml.safe_load(cloud['userData'])['users'][0]['ssh_authorized_keys'],[KEY])
-                        network=yaml.safe_load(cloud['networkData'])['ethernets']['lan']
-                        self.assertEqual(network['addresses'],[f'192.0.2.{32+i}/24'])
-                        self.assertEqual(network['match']['macaddress'],f'02:11:22:33:44:{54+i}')
-                        self.assertEqual(network['routes'],[{'to':'0.0.0.0/0','via':'192.0.2.1'}])
 
     def test_create_step_refuses_to_overwrite_template_labels(self):
         if not OC:

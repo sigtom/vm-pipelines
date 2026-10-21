@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Request VM networking through AAP; standard library only, no Infoblox calls.
+"""Infoblox NIOS WAPI allocation for VM requests; Python standard library only.
 
-Commands: check-ssh-key (offline), check-aap (GET only), or no arguments to
-allocate. Write the existing allocation file only after a verified AAP result.
+Writes a recovery receipt, not VM YAML. No retries, rollback, or guest credentials.
+Use check-ssh-key for offline SSH validation without contacting IPAM.
 """
 from __future__ import annotations
 
@@ -16,25 +16,24 @@ import re
 import secrets
 import struct
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 HOST = re.compile(r"^[a-z][a-z0-9-]{0,61}[a-z0-9]$")
 DOMAIN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
-IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-INPUTS = {"request_id", "vm_name", "mac_address", "network_profile"}
+WAPI_VERSION = re.compile(r"^v?([0-9]{1,3}\.[0-9]{1,3}(?:\.[0-9]{1,3})?)$")
+HOST_REF = re.compile(r"^record:host/[A-Za-z0-9_.:/-]{1,300}$")
 ED25519_PREFIX = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32)
 
 
 class AllocationError(RuntimeError):
-    """Only curated, credential-safe messages are printed."""
+    """Curated, credential-safe error text."""
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
-        return None
+        return None  # Never forward authentication to a redirected host.
 
 
 OPENER = urllib.request.build_opener(_NoRedirect)
@@ -68,161 +67,137 @@ def validate_ssh_key(value):
     return value
 
 
-def positive_int(value, label, maximum):
-    if not re.fullmatch(r"[1-9][0-9]*", str(value)) or int(value) > maximum:
-        raise AllocationError(f"Invalid {label}")
-    return int(value)
-
-
-def settings():
-    base = required("AAP_API_BASE_URL").rstrip("/")
-    parts = urllib.parse.urlsplit(base)
-    if (parts.scheme != "https" or not parts.hostname or parts.username or parts.password
-            or parts.query or parts.fragment or any(c.isspace() for c in base)
-            or parts.path not in ("/api/v2", "/api/controller/v2")):
-        raise AllocationError("AAP_API_BASE_URL must be HTTPS ending /api/v2 or /api/controller/v2")
-    token = required("AAP_TOKEN")
-    if any(c.isspace() for c in token) or not token.isascii():
-        raise AllocationError("AAP_TOKEN must be a single ASCII token")
-    profile = required("NETWORK_PROFILE")
-    if not IDENTIFIER.fullmatch(profile):
-        raise AllocationError("Invalid NETWORK_PROFILE identifier")
-    return dict(base=base, token=token, profile=profile,
-                template=positive_int(required("AAP_JOB_TEMPLATE_ID"), "AAP_JOB_TEMPLATE_ID", 2147483647),
-                timeout=positive_int(os.environ.get("AAP_JOB_TIMEOUT_SECONDS", "600"), "AAP_JOB_TIMEOUT_SECONDS", 3600),
-                interval=positive_int(os.environ.get("AAP_POLL_INTERVAL_SECONDS", "5"), "AAP_POLL_INTERVAL_SECONDS", 60))
-
-
-def request(config, method, path, data=None, timeout=30):
-    # Paths are constructed here from integer IDs, never followed from API responses.
-    url = config["base"] + "/" + path
-    headers = {"Accept": "application/json", "Content-Type": "application/json",
-               "Authorization": "Bearer " + config["token"]}
-    body = None if data is None else json.dumps(data).encode()
-    try:
-        with OPENER.open(urllib.request.Request(url, headers=headers, data=body,
-                                               method=method), timeout=timeout) as response:
-            raw = response.read(2 * 1024 * 1024 + 1)
-            if len(raw) > 2 * 1024 * 1024:
-                raise AllocationError("AAP response exceeds size limit")
-            result = json.loads(raw)
-            if not isinstance(result, dict):
-                raise AllocationError("AAP response must be a JSON object")
-            return result
-    except urllib.error.HTTPError as exc:
-        raise AllocationError(f"AAP {method} failed: HTTP {exc.code}") from None
-    except OSError:
-        raise AllocationError(f"AAP {method} failed: network or TLS error") from None
-    except (ValueError, TypeError):
-        raise AllocationError("AAP returned invalid JSON") from None
-
-
-def preflight(config):
-    """Read-only template checks. The real playbook must still validate the inputs."""
-    path = f'job_templates/{config["template"]}/'
-    template = request(config, "GET", path)
-    if template.get("job_type") != "run" or template.get("job_slice_count", 1) != 1:
-        raise AllocationError("AAP template must be a regular run job, without slicing")
-    if template.get("ask_variables_on_launch") is not True:
-        if template.get("survey_enabled") is not True:
-            raise AllocationError("Enable AAP Prompt on launch for variables or a survey for all four inputs")
-        spec = request(config, "GET", path + "survey_spec/").get("spec")
-        if not isinstance(spec, list) or not INPUTS <= {x.get("variable") for x in spec if isinstance(x, dict)}:
-            raise AllocationError("AAP survey must accept all four contract inputs")
-    launch = request(config, "GET", path + "launch/")
-    if any(launch.get(key) for key in ("passwords_needed_to_start", "credential_needed_to_start", "inventory_needed_to_start")):
-        raise AllocationError("AAP job requires launch credentials or inventory; configure unattended execution")
-    needed = launch.get("variables_needed_to_start", [])
-    if not isinstance(needed, list) or any(x not in INPUTS for x in needed):
-        raise AllocationError("AAP job requires extra inputs outside the agreed contract")
-
-
 def ipv4(value):
     try:
         if not isinstance(value, str):
             raise ValueError
         address = ipaddress.ip_address(value)
-        if (address.version != 4 or address.is_unspecified or address.is_multicast
-                or address.is_loopback or address == ipaddress.ip_address("255.255.255.255")):
+        if address.version != 4:
             raise ValueError
         return address
     except (ValueError, TypeError):
-        raise AllocationError("Invalid IPv4 address in AAP result") from None
+        raise AllocationError("Invalid IPv4 address") from None
 
 
-def validate_result(result, sent):
-    if not isinstance(result, dict) or type(result.get("schema_version")) is not int or result["schema_version"] != 1:
-        raise AllocationError("Missing or unsupported artifacts.vm_network schema_version")
-    for key in INPUTS:
-        if result.get(key) != sent[key]:
-            raise AllocationError(f"AAP result does not match request field: {key}")
-    cidr = result.get("ip_cidr")
+def network_settings(prefix, gateway, dns, domain, start, end, dhcp_start="", dhcp_end=""):
     try:
-        if not isinstance(cidr, str) or not re.fullmatch(r"[0-9.]+/[0-9]{1,2}", cidr):
-            raise ValueError
-        iface = ipaddress.ip_interface(cidr)
-        if iface.version != 4 or not 1 <= iface.network.prefixlen <= 30:
-            raise ValueError
+        net = ipaddress.ip_network(prefix, strict=True)
     except (ValueError, TypeError):
-        raise AllocationError("AAP ip_cidr must contain a usable IPv4 address and /1 through /30 prefix") from None
-    address = ipv4(str(iface.ip))
-    gateway = ipv4(result.get("gateway"))
-    edges = (iface.network.network_address, iface.network.broadcast_address)
-    if address in edges or gateway in edges or gateway not in iface.network or gateway == address:
-        raise AllocationError("AAP result has an invalid guest address or gateway")
-    servers = result.get("dns_servers")
-    if not isinstance(servers, list) or not servers:
-        raise AllocationError("AAP dns_servers must be a nonempty list")
-    dns = [str(ipv4(server)) for server in servers]
-    domain = result.get("domain")
-    if not isinstance(domain, str) or len(domain) > 253 or not DOMAIN.fullmatch(domain):
-        raise AllocationError("Invalid domain in AAP result")
-    fqdn = sent["vm_name"] + "." + domain
-    if len(fqdn) > 253 or result.get("fqdn") != fqdn:
-        raise AllocationError("AAP fqdn must match vm_name plus domain")
-    return [sent["vm_name"], str(iface), sent["mac_address"], str(gateway), ",".join(dns), domain]
+        raise AllocationError("Invalid network prefix") from None
+    if net.version != 4 or net.num_addresses < 8:
+        raise AllocationError("A usable IPv4 network is required")
+    first, last, gw = ipv4(start), ipv4(end), ipv4(gateway)
+    if not net.network_address < first <= last < net.broadcast_address:
+        raise AllocationError("Static pool is outside network or includes reserved addresses")
+    if first == net.network_address + 1 and last == net.broadcast_address - 1:
+        raise AllocationError("Refusing whole-subnet allocation")
+    if (not isinstance(dns, str) or not isinstance(domain, str) or len(domain) > 253
+            or not DOMAIN.fullmatch(domain)):
+        raise AllocationError("Invalid DNS configuration")
+    servers = [ipv4(x.strip()) for x in dns.split(",") if x.strip()]
+    edges = (net.network_address, net.broadcast_address)
+    if not servers or any(x in edges for x in servers):
+        raise AllocationError("Invalid DNS server address")
+    if gw not in net or gw in edges:
+        raise AllocationError("Gateway must be a usable address in the network")
+    if any(first <= x <= last for x in [gw, *servers]):
+        raise AllocationError("Static pool overlaps gateway or DNS")
+    if dhcp_start or dhcp_end:
+        if not dhcp_start or not dhcp_end:
+            raise AllocationError("Incomplete DHCP range")
+        ds, de = ipv4(dhcp_start), ipv4(dhcp_end)
+        if (not net.network_address < ds <= de < net.broadcast_address
+                or ds <= last and de >= first):
+            raise AllocationError("Static pool overlaps DHCP or DHCP is invalid")
+        if any(ds <= x <= de for x in [gw, *servers]):
+            raise AllocationError("DHCP pool overlaps gateway or DNS")
+    return dict(net=net, start=str(first), end=str(last), gateway=str(gw),
+                dns=",".join(map(str, servers)), domain=domain, dhcp=bool(dhcp_start))
 
 
-def event(journal, **data):
-    line = json.dumps(data, sort_keys=True)
-    journal.write(line + "\n")
-    journal.flush()
-    print("AAP_REQUEST " + line, flush=True)
+def request(base, method, path, data=None, *, user, password):
+    url = base.rstrip("/") + "/" + path.lstrip("/")
+    headers = {
+        "Accept": "application/json", "Content-Type": "application/json",
+        "Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode(),
+    }
+    body = None if data is None else json.dumps(data).encode()
+    try:
+        with OPENER.open(urllib.request.Request(url, headers=headers, data=body,
+                                               method=method), timeout=20) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        raise AllocationError(f"IPAM {method} failed: HTTP {exc.code}") from None
+    except OSError:
+        raise AllocationError(f"IPAM {method} failed: network or TLS error") from None
+    except (ValueError, TypeError):
+        raise AllocationError("Invalid JSON response from IPAM") from None
 
 
-def allocate(config, sent, journal):
-    # Persist identity BEFORE POST. Any failed/uncertain launch must be reconciled,
-    # not replayed. No automatic cancellation; a timed-out job may still be running.
-    event(journal, event="prepared", template_id=config["template"], **sent)
-    deadline = time.monotonic() + config["timeout"]
-    launched = request(config, "POST", f'job_templates/{config["template"]}/launch/',
-                       {"extra_vars": sent}, timeout=min(30, config["timeout"]))
-    job_id = launched.get("job", launched.get("id"))
-    if type(job_id) is not int or job_id <= 0:
-        raise AllocationError("Launch may have succeeded but returned no valid job ID; reconcile by request_id")
-    event(journal, event="launched", job_id=job_id, **sent)
-    if launched.get("ignored_fields"):
-        raise AllocationError("AAP ignored launch inputs; job may already be running; reconcile before retrying")
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise AllocationError(f"AAP job {job_id} timed out locally; it was NOT canceled")
-        job = request(config, "GET", f"jobs/{job_id}/", timeout=min(30, remaining))
-        if job.get("id") != job_id or job.get("job_template") != config["template"]:
-            raise AllocationError("AAP job identity does not match the launched job/template")
-        if time.monotonic() >= deadline:
-            raise AllocationError(f"AAP job {job_id} exceeded the local deadline; reconcile its status")
-        status = job.get("status")
-        if status == "successful":
-            artifacts = job.get("artifacts")
-            record = validate_result(artifacts.get("vm_network") if isinstance(artifacts, dict) else None, sent)
-            event(journal, event="validated", job_id=job_id, ip_cidr=record[1], **sent)
-            return record
-        if status in ("failed", "error", "canceled"):
-            raise AllocationError(f"AAP job {job_id} ended {status}; allocation may exist")
-        if status not in ("new", "pending", "waiting", "running"):
-            raise AllocationError(f"AAP job {job_id} returned an unknown status")
-        time.sleep(min(config["interval"], max(0, deadline - time.monotonic())))
+def infoblox_preflight(names):
+    version = WAPI_VERSION.fullmatch(required("INFOBLOX_WAPI_VERSION"))
+    if not version:
+        raise AllocationError("INFOBLOX_WAPI_VERSION must look like 2.12 or v2.12")
+    origin = required("IPAM_URL").rstrip("/")
+    parts = urllib.parse.urlsplit(origin)
+    if (parts.scheme != "https" or not parts.hostname or parts.username or parts.password
+            or parts.query or parts.fragment or parts.path or any(c.isspace() for c in origin)):
+        raise AllocationError("IPAM_URL must be an HTTPS origin without path or credentials")
+    base = origin + "/wapi/v" + version.group(1)
+    user, password = required("INFOBLOX_USERNAME"), required("INFOBLOX_PASSWORD")
+    view, network_view = required("INFOBLOX_DNS_VIEW"), required("INFOBLOX_NETWORK_VIEW")
+    if any(not s.isprintable() or s != s.strip() for s in (view, network_view)) or "," in network_view:
+        raise AllocationError("Invalid Infoblox view name")
+    settings = network_settings(
+        required("INFOBLOX_NETWORK"), required("GATEWAY"), required("DNS_SERVERS"),
+        required("DOMAIN"), required("STATIC_START"), required("STATIC_END"),
+        os.environ.get("DHCP_START", ""), os.environ.get("DHCP_END", ""))
+    disabled = os.environ.get("DHCP_DISABLED", "false")
+    if disabled not in ("true", "false") or settings["dhcp"] and disabled == "true":
+        raise AllocationError("DHCP_DISABLED must be true or false and must not conflict with a DHCP range")
+    if not settings["dhcp"] and disabled != "true":
+        raise AllocationError("Set DHCP_START and DHCP_END, or explicitly set DHCP_DISABLED=true")
+    settings["network_view"] = network_view
+
+    def call(method, path, body=None):
+        return request(base, method, path, body, user=user, password=password)
+
+    for name in names:
+        hostname = name + "." + settings["domain"]
+        if len(hostname) > 253:
+            raise AllocationError("VM FQDN is too long")
+        query = urllib.parse.urlencode({"name": hostname, "view": view})
+        found = call("GET", "record:host?" + query)
+        if not isinstance(found, list):
+            raise AllocationError("Unexpected Infoblox host search response shape")
+        if found:
+            raise AllocationError(f"Host {hostname} already exists in Infoblox")
+    return call, settings, view
+
+
+def infoblox_allocate(call, settings, view, name, mac):
+    fqdn = name + "." + settings["domain"]
+    network_view = settings["network_view"]
+    # Reserve through one server-side host insertion. No client-side free-IP scan.
+    ref = call("POST", "record:host", {
+        "name": fqdn, "view": view, "network_view": network_view,
+        "configure_for_dns": True,
+        "ipv4addrs": [{
+            "ipv4addr": f'func:nextavailableip:{settings["start"]}-{settings["end"]},{network_view}'
+        }],
+    })
+    if not isinstance(ref, str) or not HOST_REF.fullmatch(ref):
+        raise AllocationError(f"Host {fqdn} may exist; inspect the DNS/network view before retrying")
+    print(f"RESERVED host={fqdn} mac={mac} dns-view={view} network-view={network_view}", flush=True)
+    obj = call("GET", ref + "?_return_fields=ipv4addrs")
+    addrs = obj.get("ipv4addrs") if isinstance(obj, dict) else None
+    if not isinstance(addrs, list) or len(addrs) != 1 or not isinstance(addrs[0], dict):
+        raise AllocationError(f"Host {fqdn} exists but its address response is invalid; reconcile manually")
+    address = ipv4(addrs[0].get("ipv4addr"))
+    if not ipv4(settings["start"]) <= address <= ipv4(settings["end"]):
+        raise AllocationError(f"Host {fqdn} exists but its address is outside the pool; reconcile manually")
+    # DNS host record only: no DHCP fixed address or MAC registration in Infoblox.
+    return f'{address}/{settings["net"].prefixlen}'
 
 
 def main(argv=()):
@@ -230,41 +205,33 @@ def main(argv=()):
         validate_ssh_key(required("REQ_SSH_KEY"))
         print("SSH public key format OK")
         return
-    if argv and list(argv) != ["check-aap"]:
-        raise AllocationError("Unknown command; use check-ssh-key, check-aap, or no arguments")
-    config = settings()
     if argv:
-        preflight(config)
-        print("AAP read-only template checks passed; no job launched")
-        return
+        raise AllocationError("Unknown command; use no arguments or check-ssh-key")
     names = Path(required("VM_NAMES_FILE")).read_text().splitlines()
     if not names or len(names) > 5 or len(set(names)) != len(names) or not all(HOST.fullmatch(x) for x in names):
         raise AllocationError("Invalid, empty or duplicate VM names")
-    run_id = required("REQUEST_ID")
-    if not IDENTIFIER.fullmatch(run_id):
-        raise AllocationError("REQUEST_ID must be the safe PipelineRun UID")
     output = Path(required("ALLOCATIONS_FILE"))
     output.parent.mkdir(parents=True, exist_ok=True)
-    # Files are exclusive and never resumed automatically. Keep both plus job logs.
-    with output.open("x", encoding="utf-8") as receipt, output.with_suffix(".requests.jsonl").open("x", encoding="utf-8") as journal:
-        preflight(config)
+    # Exclusive creation prevents a second invocation from discarding a recovery receipt.
+    with output.open("x", encoding="utf-8") as receipt:
+        call, settings, view = infoblox_preflight(names)
         seen = set()
         for name in names:
-            sent = dict(request_id=f"{run_id}/{name}/lan", vm_name=name,
-                        mac_address="02:" + ":".join(f"{x:02x}" for x in secrets.token_bytes(5)),
-                        network_profile=config["profile"])
+            mac = "02:" + ":".join(f"{x:02x}" for x in secrets.token_bytes(5))
             try:
-                record = allocate(config, sent, journal)
-                address = str(ipaddress.ip_interface(record[1]).ip)
+                cidr = infoblox_allocate(call, settings, view, name, mac)
+                address = str(ipaddress.ip_interface(cidr).ip)
                 if address in seen:
-                    raise AllocationError("AAP returned a duplicate address in this batch; reconcile both jobs")
+                    raise AllocationError(f"Duplicate allocated address for {name}; inspect both host records")
                 seen.add(address)
+                record = [name, cidr, mac, settings["gateway"], settings["dns"], settings["domain"]]
                 receipt.write("|".join(record) + "\n")
                 receipt.flush()
+                print(f"Reserved {name} -> {cidr}", flush=True)
             except Exception as exc:
                 raise AllocationError(
-                    f"Request stopped at {name}; inspect AAP_REQUEST logs and journal before retrying. "
-                    f"No jobs canceled or records deleted. {describe(exc)}") from None
+                    f"Request stopped at {name}; prior reservations remain. "
+                    f"Inspect the receipt and Infoblox before retrying. {describe(exc)}") from None
 
 
 if __name__ == "__main__":
