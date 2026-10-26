@@ -1,4 +1,5 @@
-# Native VM definition processed by oc. Does not create anything on installation.
+# Native BIOS/VirtIO VM definition for a prepared golden image.
+# The existing guest account owns password/groups/sudo policy; only add its SSH key.
 apiVersion: template.openshift.io/v1
 kind: Template
 metadata:
@@ -27,6 +28,9 @@ parameters:
     required: true
   - name: DATASOURCE_NAMESPACE
     required: true
+  - name: MACHINE_TYPE
+    description: Approved QEMU machine type from the working golden-image VM.
+    required: true
   - name: NETWORK_ATTACHMENT
     required: true
   - name: MAC_ADDRESS
@@ -40,9 +44,8 @@ parameters:
   - name: DOMAIN
     required: true
   - name: GUEST_USER
-    value: cloud-user
-  - name: SUDO_POLICY
-    value: "false"
+    description: Existing non-root account in the golden image; no account is created.
+    required: true
   - name: SSH_PUBLIC_KEY
     required: true
 objects:
@@ -84,9 +87,15 @@ objects:
         spec:
           terminationGracePeriodSeconds: 180
           domain:
+            machine:
+              type: ${MACHINE_TYPE}
+            firmware:
+              bootloader:
+                bios: {}
             devices:
               disks:
                 - name: rootdisk
+                  bootOrder: 1
                   disk:
                     bus: virtio
                 - name: cloudinitdisk
@@ -94,6 +103,7 @@ objects:
                     bus: virtio
               interfaces:
                 - name: lan
+                  model: virtio
                   bridge: {}
                   macAddress: "${MAC_ADDRESS}"
           networks:
@@ -110,18 +120,39 @@ objects:
                   #cloud-config
                   hostname: ${VM_NAME}
                   fqdn: ${VM_NAME}.${DOMAIN}
-                  manage_etc_hosts: true
-                  ssh_pwauth: false
-                  disable_root: true
-                  users:
-                    - name: ${GUEST_USER}
-                      lock_passwd: true
-                      groups: wheel
-                      sudo: ${SUDO_POLICY}
-                      ssh_authorized_keys:
-                        - |-
-                          ${SSH_PUBLIC_KEY}
-                  # Salt bootstrap remains disabled until customer approval.
+                  preserve_hostname: false
+                  # Do not invoke user creation/locking/sudo defaults on existing accounts.
+                  users: []
+                  write_files:
+                    - path: /run/vm-provision-public-key
+                      owner: root:root
+                      permissions: '0600'
+                      content: |-
+                        ${SSH_PUBLIC_KEY}
+                  runcmd:
+                    - |
+                      set -eu
+                      user='${GUEST_USER}'
+                      uid=$(id -u "$user")
+                      test "$uid" -ne 0
+                      home=$(getent passwd "$user" | cut -d: -f6)
+                      case "$home" in /*) ;; *) exit 1 ;; esac
+                      test -d "$home"
+                      group=$(id -gn "$user")
+                      keys="$home/.ssh/authorized_keys"
+                      test ! -L "$home/.ssh" && test ! -L "$keys"
+                      install -d -m 0700 -o "$user" -g "$group" "$home/.ssh"
+                      touch "$keys"
+                      chown "$user:$group" "$keys"
+                      chmod 0600 "$keys"
+                      if ! grep -qxFf /run/vm-provision-public-key "$keys"; then
+                        printf '\n' >> "$keys"
+                        cat /run/vm-provision-public-key >> "$keys"
+                        printf '\n' >> "$keys"
+                      fi
+                      restorecon -RF "$home/.ssh"
+                      rm -f /run/vm-provision-public-key
+                  # No password/group/sudo/sshd policy edits, Salt bootstrap, or LVM resizing.
                 networkData: |
                   version: 2
                   ethernets:

@@ -1,5 +1,5 @@
 # Copy to site.yaml (gitignored). All values are strings; NO credentials here.
-# Namespace, RBAC, and image references must match; see docs/runbook.md.
+# Keep client names, image digests, subnets and endpoints out of the public repo.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,15 +8,16 @@ metadata:
 data:
   VM_NAMESPACE: vm-provisioning
   NETWORK_ATTACHMENT: REPLACE_ME_EXISTING_NAD
-  DATASOURCE_NAME: REPLACE_ME_APPROVED_DATASOURCE
+  DATASOURCE_NAME: REPLACE_ME_APPROVED_GOLDEN_DATASOURCE
   DATASOURCE_NAMESPACE: openshift-virtualization-os-images
   STORAGE_CLASS: REPLACE_ME_STORAGECLASS
   ACCESS_MODE: REPLACE_ME_ACCESS_MODE         # ReadWriteOnce or ReadWriteMany
   VOLUME_MODE: REPLACE_ME_VOLUME_MODE         # Filesystem or Block
-  GUEST_USER: cloud-user
-  CLOUD_USER_SUDO: "false"                   # Or explicitly approved ALL=(ALL) NOPASSWD:ALL
+  MACHINE_TYPE: REPLACE_ME_APPROVED_MACHINE_TYPE  # Match the working BIOS golden-image VM.
+  GUEST_USER: REPLACE_ME_EXISTING_GUEST_USER   # Must already exist and be allowed by guest SSH policy.
+  # Account passwords, groups and sudo stay under the golden image's policy.
   IPAM_URL: https://REPLACE_ME_INFOBLOX_HOST  # Origin only; no /wapi path
-  INFOBLOX_WAPI_VERSION: REPLACE_ME_WAPI_VERSION  # E.g. 2.12; verify appliance version
+  INFOBLOX_WAPI_VERSION: REPLACE_ME_WAPI_VERSION
   INFOBLOX_NETWORK: REPLACE_ME_IPV4_CIDR
   INFOBLOX_DNS_VIEW: REPLACE_ME_DNS_VIEW
   INFOBLOX_NETWORK_VIEW: REPLACE_ME_NETWORK_VIEW
@@ -29,7 +30,7 @@ data:
   DHCP_END: REPLACE_ME_LAST_DHCP_IP
   # If DHCP is absent, remove BOTH range keys above and change this to "true".
   DHCP_DISABLED: "false"
-  # Optional proxy settings for runtime containers; cluster proxy is not assumed.
+  # Optional runtime proxy settings (cluster proxy is not assumed):
   # HTTPS_PROXY: http://proxy.example.com:3128
   # HTTP_PROXY: http://proxy.example.com:3128
   # NO_PROXY: .svc,.cluster.local,REPLACE_ME_INTERNAL_ENDPOINTS

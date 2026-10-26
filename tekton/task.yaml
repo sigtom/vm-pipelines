@@ -78,10 +78,11 @@ spec:
         set -euo pipefail
         export LC_ALL=C
         fail() { echo "ERROR: $*" >&2; exit 1; }
+        # Binary quantities: 110G decimal would be smaller than a 104Gi source.
         case "$REQ_SIZE" in
-          small) DISK_SIZE=40Gi ;;
-          medium) DISK_SIZE=80Gi ;;
-          large) DISK_SIZE=160Gi ;;
+          small) DISK_SIZE=110Gi ;;
+          medium) DISK_SIZE=500Gi ;;
+          large) DISK_SIZE=1Ti ;;
           *) fail "size must be small, medium, or large" ;;
         esac
         case "$REQ_COUNT" in
@@ -89,16 +90,15 @@ spec:
           *) fail "count must be between 1 and 5" ;;
         esac
         [[ "$REQ_NAME" =~ ^[a-z][a-z0-9-]{0,54}[a-z0-9]$ ]] || fail "invalid VM name"
-        for setting in VM_NAMESPACE NETWORK_ATTACHMENT DATASOURCE_NAME DATASOURCE_NAMESPACE STORAGE_CLASS ACCESS_MODE VOLUME_MODE GUEST_USER IPAM_URL; do
+        for setting in VM_NAMESPACE NETWORK_ATTACHMENT DATASOURCE_NAME DATASOURCE_NAMESPACE STORAGE_CLASS ACCESS_MODE VOLUME_MODE MACHINE_TYPE GUEST_USER IPAM_URL; do
           [[ -n "${!setting:-}" && "${!setting}" != *REPLACE_ME* ]] || fail "missing site setting: $setting"
         done
         case "$ACCESS_MODE" in ReadWriteOnce|ReadWriteMany) ;; *) fail "unsupported ACCESS_MODE" ;; esac
         case "$VOLUME_MODE" in Filesystem|Block) ;; *) fail "unsupported VOLUME_MODE" ;; esac
-        [[ "$GUEST_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || fail "invalid GUEST_USER"
-        case "${CLOUD_USER_SUDO:-false}" in
-          false|'ALL=(ALL) NOPASSWD:ALL') ;;
-          *) fail "unsupported CLOUD_USER_SUDO policy" ;;
-        esac
+        [[ "$MACHINE_TYPE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || fail "invalid MACHINE_TYPE"
+        [[ "$GUEST_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$GUEST_USER" != root ]] || fail "invalid non-root GUEST_USER"
+        # Legacy false is harmless, but do not silently ignore a requested policy change.
+        [[ "${CLOUD_USER_SUDO:-false}" == false ]] || fail "CLOUD_USER_SUDO is no longer supported; preserve the golden image account policy"
 
         # Parse labels as data, never shell code. Reject invalid input before IPAM.
         trim() {
@@ -158,8 +158,7 @@ spec:
         }
         exists "$VM_NAMESPACE" templates.template.openshift.io rhel-standard
         if (( ${#labels[@]} )); then
-          # Protect all labels already owned by the approved VM Template, not just
-          # today's four defaults. This read happens before any IPAM allocation.
+          # Protect all labels already owned by the approved VM Template.
           managed=$(oc -n "$VM_NAMESPACE" get templates.template.openshift.io rhel-standard \
             -o go-template='{{range .objects}}{{if eq .kind "VirtualMachine"}}{{range $key, $value := .metadata.labels}}{{$key}}{{"\n"}}{{end}}{{end}}{{end}}') \
             || fail "cannot read Template-managed labels"
@@ -263,14 +262,13 @@ spec:
             -p "DISK_SIZE=$disk" -p "STORAGE_CLASS=$STORAGE_CLASS" \
             -p "ACCESS_MODE=$ACCESS_MODE" -p "VOLUME_MODE=$VOLUME_MODE" \
             -p "DATASOURCE_NAME=$DATASOURCE_NAME" -p "DATASOURCE_NAMESPACE=$DATASOURCE_NAMESPACE" \
+            -p "MACHINE_TYPE=$MACHINE_TYPE" \
             -p "NETWORK_ATTACHMENT=$NETWORK_ATTACHMENT" -p "GUEST_USER=$GUEST_USER" \
-            -p "SUDO_POLICY=${CLOUD_USER_SUDO:-false}" -p "MAC_ADDRESS=$mac" \
-            -p "IP_CIDR=$address" -p "GATEWAY=$gateway" \
+            -p "MAC_ADDRESS=$mac" -p "IP_CIDR=$address" -p "GATEWAY=$gateway" \
             -p "DNS_SERVERS=$dns" -p "DOMAIN=$domain" -p "SSH_PUBLIC_KEY=$REQ_SSH_KEY" \
             > "$SCRATCH/$name.yaml"
           if (( ${#labels[@]} )); then
             # Local metadata edit: labels exist at creation, no live patch or RBAC change.
-            # Never overwrite a Template label, including one added since preflight.
             if ! oc label --local --overwrite=false -f "$SCRATCH/$name.yaml" \
               -o yaml -- "${labels[@]}" > "$SCRATCH/$name.labeled.yaml"; then
               echo "FAILED: cannot add VM labels; reservations remain. Reconcile before retrying." >&2

@@ -8,10 +8,11 @@ metadata:
   annotations:
     openshift.io/display-name: Request RHEL VM
     description: >-
-      Request one to five RHEL VMs. Size: small, medium, or large. Count: 1-5.
+      Request one to five RHEL VMs from the approved golden image.
+      Root disks: small 110Gi, medium 500Gi, large 1Ti. Count: 1-5.
       Name must be unused. Counts above 1 add numbered suffixes.
-      SSH key must be an ed25519 public key. Additional VM labels are optional.
-      Creates a real PipelineRun.
+      SSH key is added to the existing approved guest account.
+      Additional VM labels are optional. Creates a real PipelineRun.
     tags: rhel,vm,virtualization,request,pipeline
     iconClass: icon-rhel
 objects:
@@ -45,7 +46,7 @@ parameters:
     required: true
   - name: SIZE
     displayName: Size
-    description: small, medium, or large
+    description: "small: 2 vCPU / 4Gi RAM / 110Gi disk; medium: 4 / 8Gi / 500Gi; large: 8 / 16Gi / 1Ti."
     value: small
     required: true
   - name: COUNT
@@ -55,7 +56,7 @@ parameters:
     required: true
   - name: SSH_PUBLIC_KEY
     displayName: SSH public key
-    description: An OpenSSH ed25519 public key, not a private key
+    description: An OpenSSH ed25519 public key for the approved existing guest account, not a private key.
     required: true
   - name: VM_LABELS
     displayName: Additional VM labels
