@@ -5,7 +5,10 @@ kind: ConfigMap
 metadata:
   name: vm-provision-config
   namespace: vm-provisioning
+
 data:
+  # Default VM destination for requests without target-namespace.
+  # The pipeline's actual execution namespace comes from the Pod downward API.
   VM_NAMESPACE: vm-provisioning
   NETWORK_ATTACHMENT: REPLACE_ME_EXISTING_NAD
   DATASOURCE_NAME: REPLACE_ME_APPROVED_GOLDEN_DATASOURCE
@@ -13,8 +16,8 @@ data:
   STORAGE_CLASS: REPLACE_ME_STORAGECLASS
   ACCESS_MODE: REPLACE_ME_ACCESS_MODE         # ReadWriteOnce or ReadWriteMany
   VOLUME_MODE: REPLACE_ME_VOLUME_MODE         # Filesystem or Block
-  MACHINE_TYPE: REPLACE_ME_APPROVED_MACHINE_TYPE  # Match the working BIOS golden-image VM.
-  GUEST_USER: REPLACE_ME_EXISTING_GUEST_USER   # Must already exist and be allowed by guest SSH policy.
+  MACHINE_TYPE: REPLACE_ME_APPROVED_MACHINE_TYPE
+  GUEST_USER: REPLACE_ME_EXISTING_GUEST_USER
   # Account passwords, groups and sudo stay under the golden image's policy.
   IPAM_URL: https://REPLACE_ME_INFOBLOX_HOST  # Origin only; no /wapi path
   INFOBLOX_WAPI_VERSION: REPLACE_ME_WAPI_VERSION

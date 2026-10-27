@@ -35,7 +35,7 @@ class DirectModeTests(unittest.TestCase):
         self.assertNotIn('INFOBLOX_PASSWORD', site)
         pipeline = yaml.safe_load((ROOT / 'tekton/pipeline.yaml').read_text())['spec']
         self.assertEqual([p['name'] for p in pipeline['params']],
-                         ['vm-name', 'size', 'count', 'ssh-public-key', 'vm-labels'])
+                         ['vm-name', 'size', 'count', 'ssh-public-key', 'vm-labels', 'target-namespace'])
 
 
 if __name__ == '__main__':

@@ -4,7 +4,7 @@ metadata:
   name: vm-provision
   namespace: vm-provisioning
 spec:
-  description: Create one to five VMs from the approved native Template.
+  description: Create one to five VMs in an approved target namespace using central provisioning resources.
   params:
     - name: vm-name
       type: string
@@ -23,6 +23,10 @@ spec:
       type: string
       default: ""
       description: "Optional VM labels separated by semicolons, e.g. foo=bar;boo=far. Applied to every VM in the request."
+    - name: target-namespace
+      type: string
+      default: ""
+      description: Approved VM destination. Empty preserves the administrator's VM_NAMESPACE default.
   workspaces:
     - name: scratch
     - name: network
@@ -44,6 +48,8 @@ spec:
           value: $(params.ssh-public-key)
         - name: vm-labels
           value: $(params.vm-labels)
+        - name: target-namespace
+          value: $(params.target-namespace)
       workspaces:
         - name: scratch
           workspace: scratch

@@ -1,5 +1,4 @@
-# Install separately. Instantiating the catalog entry starts real provisioning.
-# Use the vm-provisioning project; the processor supplies the object's namespace.
+# Request runs centrally. The separate TARGET_NAMESPACE controls VM placement.
 apiVersion: template.openshift.io/v1
 kind: Template
 metadata:
@@ -10,9 +9,10 @@ metadata:
     description: >-
       Request one to five RHEL VMs from the approved golden image.
       Root disks: small 110Gi, medium 500Gi, large 1Ti. Count: 1-5.
-      Name must be unused. Counts above 1 add numbered suffixes.
-      SSH key is added to the existing approved guest account.
-      Additional VM labels are optional. Creates a real PipelineRun.
+      Keep the top Namespace selector on the provisioning project.
+      Target VM namespace is the approved destination for VMs and their disks.
+      SSH key is added to the existing approved guest account. Labels are optional.
+      Creates a real PipelineRun; Infoblox configuration must be ready.
     tags: rhel,vm,virtualization,request,pipeline
     iconClass: icon-rhel
 objects:
@@ -39,6 +39,8 @@ objects:
           value: ${SSH_PUBLIC_KEY}
         - name: vm-labels
           value: ${VM_LABELS}
+        - name: target-namespace
+          value: ${TARGET_NAMESPACE}
 parameters:
   - name: VM_NAME
     displayName: VM name
@@ -60,6 +62,11 @@ parameters:
     required: true
   - name: VM_LABELS
     displayName: Additional VM labels
-    description: "Optional. Separate labels with semicolons: foo=bar;boo=far. Applied to all VMs in this request. Template-managed labels cannot be replaced."
+    description: "Optional. Separate labels with semicolons: foo=bar;boo=far. Applied to all VMs in this request."
     value: ""
     required: false
+  - name: TARGET_NAMESPACE
+    displayName: Target VM namespace
+    description: Existing approved destination with the selected NAD and instance types. Keep the top Namespace selector on vm-provisioning.
+    value: vm-provisioning
+    required: true

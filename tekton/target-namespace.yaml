@@ -1,0 +1,86 @@
+# ADMIN ONLY: process locally, review, and apply once per approved destination.
+# Does not create a Namespace, PipelineRun, VM, Secret, NAD, or source-image grant.
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: vm-provision-target-setup
+parameters:
+  - name: TARGET_NAMESPACE
+    description: Existing approved VM namespace; never a system namespace.
+    required: true
+  - name: PROVISIONING_NAMESPACE
+    description: Namespace of the central vm-provision ServiceAccount.
+    value: vm-provisioning
+    required: true
+objects:
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: vm-provision-target
+      namespace: ${TARGET_NAMESPACE}
+    rules:
+      - apiGroups: [kubevirt.io]
+        resources: [virtualmachines]
+        verbs: [get, create]
+      - apiGroups: [cdi.kubevirt.io]
+        resources: [datavolumes]
+        verbs: [get]
+      - apiGroups: [""]
+        resources: [persistentvolumeclaims]
+        verbs: [get]
+      - apiGroups: [k8s.cni.cncf.io]
+        resources: [network-attachment-definitions]
+        verbs: [get]
+      - apiGroups: [instancetype.kubevirt.io]
+        resources: [virtualmachineinstancetypes]
+        resourceNames: [poc-small, poc-medium, poc-large]
+        verbs: [get]
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: vm-provision-target
+      namespace: ${TARGET_NAMESPACE}
+    subjects:
+      - kind: ServiceAccount
+        name: vm-provision
+        namespace: ${PROVISIONING_NAMESPACE}
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: vm-provision-target
+  - apiVersion: instancetype.kubevirt.io/v1beta1
+    kind: VirtualMachineInstancetype
+    metadata:
+      name: poc-small
+      namespace: ${TARGET_NAMESPACE}
+      labels:
+        app.kubernetes.io/part-of: vm-pipelines
+    spec:
+      cpu:
+        guest: 2
+      memory:
+        guest: 4Gi
+  - apiVersion: instancetype.kubevirt.io/v1beta1
+    kind: VirtualMachineInstancetype
+    metadata:
+      name: poc-medium
+      namespace: ${TARGET_NAMESPACE}
+      labels:
+        app.kubernetes.io/part-of: vm-pipelines
+    spec:
+      cpu:
+        guest: 4
+      memory:
+        guest: 8Gi
+  - apiVersion: instancetype.kubevirt.io/v1beta1
+    kind: VirtualMachineInstancetype
+    metadata:
+      name: poc-large
+      namespace: ${TARGET_NAMESPACE}
+      labels:
+        app.kubernetes.io/part-of: vm-pipelines
+    spec:
+      cpu:
+        guest: 8
+      memory:
+        guest: 16Gi

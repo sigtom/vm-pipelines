@@ -1,4 +1,4 @@
-"""Native per-network catalog processing and profile isolation; no live APIs."""
+"""Native network catalog, target routing and profile isolation; no live APIs."""
 import json
 import os
 from pathlib import Path
@@ -44,14 +44,15 @@ class NetworkCatalogTests(unittest.TestCase):
         self.task = yaml.safe_load((ROOT / 'tekton/task.yaml').read_text())['spec']
         self.env = dict(SITE, PATH=str(self.bin) + ':' + os.environ['PATH'], HOME=str(self.root),
                         KUBECONFIG=str(self.root / 'no-kubeconfig'), SCRATCH=str(self.scratch),
+                        EXECUTION_NAMESPACE='vm-provisioning',
                         NETWORK_PROFILE_BOUND='true', NETWORK_PROFILE_PATH=str(self.profile),
                         REQ_NAME='web-01', REQ_SIZE='small', REQ_COUNT='1', REQ_LABELS='foo=bar;boo=far',
                         REQ_SSH_KEY=KEY, CALLS=str(self.calls), REAL_OC=OC or '',
                         VM_TEMPLATE=str(ROOT / 'templates/rhel-vm.yaml'), CREATED=str(self.created),
                         VM_NAMES_FILE=str(self.scratch / 'names'), ALLOCATIONS_FILE=str(self.scratch / 'allocations'),
                         PROFILE_FIELDS=' '.join(FIELDS))
-        # The CLI is mocked except real oc process/label --local; python3 is a
-        # fake helper that records its environment without making any HTTP call.
+        # All Kubernetes calls are faked except real native local rendering.
+        # The python3 shim records network settings instead of contacting Infoblox.
         fake = '''import json, os, shutil, sys
 from pathlib import Path
 name=Path(sys.argv[0]).name
@@ -66,17 +67,29 @@ if name=='python3':
 elif args[0] in ('process','label'):
     assert '--local' in args
     os.execv(os.environ['REAL_OC'],[os.environ['REAL_OC'],*args])
-elif 'auth' in args: print('yes')
+elif 'auth' in args:
+    denied=os.environ.get('DENY_TARGET') and 'virtualmachines.kubevirt.io' in args
+    print('no' if denied else 'yes')
+    if denied: sys.exit(1)
 elif 'get' in args:
     i=args.index('get'); kind=args[i+1]; obj=args[i+2]
+    ns=args[args.index('-n')+1]
     if kind.startswith('templates.'):
+        assert ns==os.environ['EXECUTION_NAMESPACE'], 'VM Template must stay central'
         if 'yaml' in args: sys.stdout.write(Path(os.environ['VM_TEMPLATE']).read_text())
         elif any(x.startswith('go-template=') for x in args): print('vm-pipelines/size')
         else: print('present')
-    elif kind.startswith(('virtualmachineinstancetypes.','network-attachment-definitions.')): print('present')
-    elif kind.startswith('datasources.'): print('True|golden-root|image-sources')
-    elif kind=='persistentvolumeclaims' and obj=='golden-root': print('Bound|approved-storage|Block|104Gi')
-    elif kind.startswith(('virtualmachines.','datavolumes.')) or kind=='persistentvolumeclaims': pass
+    elif kind.startswith(('virtualmachineinstancetypes.','network-attachment-definitions.')):
+        assert ns==(os.environ.get('REQ_TARGET_NAMESPACE') or os.environ['VM_NAMESPACE'])
+        if os.environ.get('FAIL_KIND') and kind.startswith(os.environ['FAIL_KIND']): sys.exit(1)
+        if not (os.environ.get('MISSING_KIND') and kind.startswith(os.environ['MISSING_KIND'])): print('present')
+    elif kind.startswith('datasources.'):
+        assert ns=='image-sources'; print('True|golden-root|image-sources')
+    elif kind=='persistentvolumeclaims' and obj=='golden-root':
+        assert ns=='image-sources'; print('Bound|approved-storage|Block|104Gi')
+    elif kind.startswith(('virtualmachines.','datavolumes.')) or kind=='persistentvolumeclaims':
+        assert ns==(os.environ.get('REQ_TARGET_NAMESPACE') or os.environ['VM_NAMESPACE'])
+        if os.environ.get('PRESENT_KIND') and kind.startswith(os.environ['PRESENT_KIND']): print('present')
     else: sys.exit(97)
 elif 'create' in args:
     src=Path(args[args.index('-f')+1]); shutil.copyfile(src,Path(os.environ['CREATED'])/src.name)
@@ -110,9 +123,9 @@ else: sys.exit(97)
                 self.fail('oc required in CI')
             self.skipTest('oc not installed')
 
-    def test_optional_workspace_keeps_five_inputs_and_existing_identity(self):
+    def test_optional_workspace_keeps_existing_identity_and_six_inputs(self):
         pipeline = yaml.safe_load((ROOT / 'tekton/pipeline.yaml').read_text())['spec']
-        self.assertEqual(len(pipeline['params']), 5)
+        self.assertEqual(len(pipeline['params']), 6)
         workspace = next(w for w in self.task['workspaces'] if w['name'] == 'network')
         self.assertTrue(workspace['optional'])
         self.assertTrue(workspace['readOnly'])
@@ -124,7 +137,7 @@ else: sys.exit(97)
         legacy = yaml.safe_load((ROOT / 'tekton/request-template.yaml').read_text())
         self.assertEqual(legacy['objects'][0]['spec']['workspaces'], [{'name': 'scratch', 'emptyDir': {}}])
 
-    def test_native_two_stage_processing_keeps_fixed_network_and_five_form_fields(self):
+    def test_native_two_stage_processing_keeps_fixed_network_and_target(self):
         self.require_oc()
         names = set()
         for number in range(101, 106):
@@ -142,19 +155,23 @@ else: sys.exit(97)
             self.assertTrue(set(FIELDS) <= set(config['data']))
             self.assertEqual(form['metadata']['name'], entry)
             self.assertEqual(form['metadata']['annotations']['openshift.io/display-name'], f'Provision VM on VLAN {number}')
-            self.assertEqual([p['name'] for p in form['parameters']], ['VM_NAME', 'SIZE', 'COUNT', 'SSH_PUBLIC_KEY', 'VM_LABELS'])
+            self.assertEqual([p['name'] for p in form['parameters']],
+                             ['VM_NAME', 'SIZE', 'COUNT', 'SSH_PUBLIC_KEY', 'VM_LABELS', 'TARGET_NAMESPACE'])
             cmd = [OC, 'process', '--local', '-f', '-', '-o', 'json', '-p', 'VM_NAME=web-01',
                    '-p', 'SIZE=small', '-p', 'COUNT=1', '-p', 'SSH_PUBLIC_KEY=' + KEY,
-                   '-p', 'VM_LABELS=foo=bar;boo=far']
+                   '-p', 'VM_LABELS=foo=bar;boo=far', '-p', 'TARGET_NAMESPACE=team-apps']
             inner = json.loads(subprocess.check_output(cmd, input=json.dumps(form), text=True))
             run = inner['items'][0]
             self.assertEqual(run['kind'], 'PipelineRun')
             self.assertEqual(run['metadata']['name'], 'vm-request-web-01')
+            self.assertNotEqual(run['metadata'].get('namespace'), 'team-apps')
             self.assertEqual(run['spec']['pipelineRef']['name'], 'vm-provision')
             self.assertEqual(run['spec']['taskRunTemplate']['serviceAccountName'], 'vm-provision')
             self.assertEqual(run['spec']['workspaces'], [{'name': 'scratch', 'emptyDir': {}},
                 {'name': 'network', 'configMap': {'name': 'vm-network-' + nad}}])
-            self.assertEqual({p['name']: p['value'] for p in run['spec']['params']}['vm-labels'], 'foo=bar;boo=far')
+            values = {p['name']: p['value'] for p in run['spec']['params']}
+            self.assertEqual(values['vm-labels'], 'foo=bar;boo=far')
+            self.assertEqual(values['target-namespace'], 'team-apps')
             names.add(config['metadata']['name'])
         self.assertEqual(len(names), 5)
 
@@ -189,13 +206,17 @@ else: sys.exit(97)
                 self.assertFalse((self.scratch / 'network.env').exists())
 
     def test_profile_data_is_not_executed_and_unknown_keys_not_exported(self):
-        self.write_profile(dict(PROFILE, INFOBLOX_DNS_VIEW='$(touch unexpected)', PATH='/bad/path'))
+        self.write_profile(dict(PROFILE, INFOBLOX_DNS_VIEW='$(touch unexpected)', PATH='/bad/path',
+                                VM_NAMESPACE='not-approved', EXECUTION_NAMESPACE='not-central'))
         run = self.run_step('preflight')
         self.assertEqual(run.returncode, 0, run.stderr)
         run = self.run_step('reserve-ip')
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertFalse((self.root / 'unexpected').exists())
-        self.assertNotIn('PATH=', (self.scratch / 'network.env').read_text())
+        snapshot = (self.scratch / 'network.env').read_text()
+        for key in ('PATH=', 'VM_NAMESPACE=', 'EXECUTION_NAMESPACE='):
+            self.assertNotIn(key, snapshot)
+        self.assertEqual((self.scratch / 'target-namespace').read_text().strip(), 'vm-provisioning')
         env = json.loads((self.scratch / 'helper-env.json').read_text())
         self.assertEqual(env['INFOBLOX_DNS_VIEW'], '$(touch unexpected)')
 
@@ -213,6 +234,7 @@ else: sys.exit(97)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertFalse((self.scratch / 'network.env').exists())
         self.assertIn('legacy-nad', self.calls.read_text())
+        self.assertEqual((self.scratch / 'target-namespace').read_text().strip(), SITE['VM_NAMESPACE'])
 
     def test_snapshot_used_for_ipam_and_vm_after_profile_changes(self):
         self.require_oc()
@@ -222,8 +244,6 @@ else: sys.exit(97)
                 self.write_profile(selected)
                 pre = self.run_step('preflight')
                 self.assertEqual(pre.returncode, 0, pre.stderr)
-                # Simulate a ConfigMap update between containers; the captured
-                # NAD and Infoblox settings must remain paired for this request.
                 (self.profile / 'NETWORK_ATTACHMENT').write_text('changed-nad')
                 (self.profile / 'GATEWAY').write_text('198.51.100.1')
                 reserve = self.run_step('reserve-ip')
@@ -241,6 +261,65 @@ else: sys.exit(97)
                 net = yaml.safe_load(cloud['networkData'])['ethernets']['lan']
                 self.assertEqual(net['addresses'], ['192.0.2.40/24'])
                 self.assertEqual(net['routes'][0]['via'], '192.0.2.1')
+
+    def test_cross_namespace_uses_local_nad_and_frozen_destination(self):
+        self.require_oc()
+        self.env['REQ_TARGET_NAMESPACE'] = 'team-apps'
+        run = self.run_step('preflight')
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual((self.scratch / 'target-namespace').read_text().strip(), 'team-apps')
+        calls = self.calls.read_text()
+        self.assertIn("'-n', 'vm-provisioning', 'get', 'templates.", calls)
+        for kind in ('network-attachment-definitions.', 'virtualmachineinstancetypes.', 'virtualmachines.', 'datavolumes.'):
+            self.assertIn("'-n', 'team-apps', 'get', '" + kind, calls)
+        self.assertNotIn("'get', 'namespaces'", calls)
+        # A later ConfigMap default change must not change the validated destination.
+        self.env['VM_NAMESPACE'] = 'changed-default'
+        self.assertEqual(self.run_step('reserve-ip').returncode, 0)
+        created = self.run_step('create-vms')
+        self.assertEqual(created.returncode, 0, created.stderr)
+        data = yaml.safe_load((self.created / 'web-01.yaml').read_text())
+        vm = data['items'][0] if data['kind'] == 'List' else data
+        self.assertEqual(vm['metadata']['namespace'], 'team-apps')
+        self.assertEqual(vm['spec']['instancetype']['name'], 'poc-small')
+        self.assertEqual(vm['spec']['dataVolumeTemplates'][0]['spec']['sourceRef']['namespace'], 'image-sources')
+        self.assertEqual(vm['spec']['template']['spec']['networks'][0]['multus']['networkName'], 'vlan-101')
+        self.assertIn("'-n', 'team-apps', 'create'", self.calls.read_text())
+        self.assertNotIn("'-n', 'changed-default'", self.calls.read_text())
+
+    def test_invalid_and_system_target_names_fail_without_api_calls(self):
+        for target in ('Team-Apps', 'a/b', 'one two', 'x\nother', '-bad', 'x' * 64,
+                       '$(touch unexpected)', 'default', 'openshift', 'openshift-operators', 'kube-system'):
+            with self.subTest(target=target):
+                self.env['REQ_TARGET_NAMESPACE'] = target
+                run = self.run_step('preflight')
+                self.assertNotEqual(run.returncode, 0)
+                self.assertFalse(self.calls.exists())
+                self.assertFalse((self.root / 'unexpected').exists())
+
+    def test_target_permissions_missing_dependencies_and_conflicts_stop_before_ipam(self):
+        cases = [{'DENY_TARGET': '1'}, {'MISSING_KIND': 'network-attachment-definitions.'},
+                 {'MISSING_KIND': 'virtualmachineinstancetypes.'}, {'FAIL_KIND': 'network-attachment-definitions.'},
+                 {'PRESENT_KIND': 'virtualmachines.'}, {'PRESENT_KIND': 'datavolumes.'},
+                 {'PRESENT_KIND': 'persistentvolumeclaims'}]
+        for failure in cases:
+            with self.subTest(failure=failure):
+                self.write_profile(PROFILE)
+                for key in ('DENY_TARGET', 'MISSING_KIND', 'FAIL_KIND', 'PRESENT_KIND'):
+                    self.env.pop(key, None)
+                self.env.update(failure, REQ_TARGET_NAMESPACE='team-apps')
+                run = self.run_step('preflight')
+                self.assertNotEqual(run.returncode, 0)
+                self.assertFalse((self.scratch / 'allocations').exists())
+                self.assertFalse((self.scratch / 'target-namespace').exists())
+                self.assertNotIn('python3 ', self.calls.read_text())
+
+    def test_creation_requires_validated_target_even_without_network_profile(self):
+        self.env['NETWORK_PROFILE_BOUND'] = 'false'
+        run = self.run_step('create-vms')
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('Missing validated target namespace', run.stderr)
+        self.assertFalse(self.calls.exists())
 
 
 if __name__ == '__main__':

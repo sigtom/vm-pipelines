@@ -1,4 +1,4 @@
-# One shared Task; Infoblox credentials are injected only into reserve-ip.
+# Central execution; only reserve-ip receives the Infoblox credential Secret.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -18,8 +18,11 @@ spec:
       type: string
       default: ""
       description: Optional semicolon-separated key=value labels for VM metadata.
+    - name: target-namespace
+      type: string
+      default: ""
+      description: Approved VM destination; empty uses the site's VM_NAMESPACE default.
     # ADMIN-ONLY image settings: change defaults before applying the Task.
-    # These are not exposed by the Pipeline or catalog request form.
     - name: cli-image
       type: string
       default: REPLACE_ME_CLI_IMAGE_BY_DIGEST
@@ -75,6 +78,12 @@ spec:
           value: $(params.count)
         - name: REQ_LABELS
           value: $(params.vm-labels)
+        - name: REQ_TARGET_NAMESPACE
+          value: $(params.target-namespace)
+        - name: EXECUTION_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         - name: SCRATCH
           value: $(workspaces.scratch.path)
         - name: NETWORK_PROFILE_BOUND
@@ -86,7 +95,7 @@ spec:
         set -euo pipefail
         export LC_ALL=C
         fail() { echo "ERROR: $*" >&2; exit 1; }
-        # Binary quantities: 110G decimal would be smaller than a 104Gi source.
+        # Binary quantities: 110G decimal is smaller than a 104Gi source.
         case "$REQ_SIZE" in
           small) DISK_SIZE=110Gi ;;
           medium) DISK_SIZE=500Gi ;;
@@ -99,11 +108,19 @@ spec:
         esac
         [[ "$REQ_NAME" =~ ^[a-z][a-z0-9-]{0,54}[a-z0-9]$ ]] || fail "invalid VM name"
 
-        # Snapshot one complete network profile. Never fall back to the site's
-        # network values when a selected profile is missing, disabled or incomplete.
+        # Execution identity/configuration stay central. Only the destination changes.
+        # The fallback supports local script tests; Pods get their actual namespace
+        # from the downward API, not from the request or a network profile.
+        EXECUTION_NAMESPACE=${EXECUTION_NAMESPACE:-${VM_NAMESPACE:?missing site VM_NAMESPACE}}
+        VM_NAMESPACE=${REQ_TARGET_NAMESPACE:-${VM_NAMESPACE:-}}
+        [[ "$VM_NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ && ${#VM_NAMESPACE} -le 63 ]] || fail "invalid target namespace"
+        case "$VM_NAMESPACE" in
+          default|kube-*|openshift|openshift-*) fail "system namespaces are not VM provisioning targets" ;;
+        esac
+
+        # Snapshot one complete network profile; never fall back to another network.
         if [[ "${NETWORK_PROFILE_BOUND:-false}" == true ]]; then
           profile=${NETWORK_PROFILE_PATH:?missing network workspace path}
-          # Pin one projected ConfigMap generation while reading its keys.
           if [[ -L "$profile/..data" ]]; then
             profile=$(readlink -f "$profile/..data") || fail "cannot resolve network profile"
           fi
@@ -119,7 +136,7 @@ spec:
               DHCP_START|DHCP_END) ;;
               *) [[ -n "$value" ]] || fail "empty network setting: $key" ;;
             esac
-            # Literal data, not shell source. Unknown profile keys are never exported.
+            # Literal data, never shell source; unknown keys cannot override namespaces.
             printf '%s=%s\n' "$key" "$value" >> "$SCRATCH/network.env.tmp"
             export "$key=$value"
           done
@@ -134,14 +151,13 @@ spec:
           fail "invalid network workspace state"
         fi
 
-        for setting in VM_NAMESPACE NETWORK_ATTACHMENT DATASOURCE_NAME DATASOURCE_NAMESPACE STORAGE_CLASS ACCESS_MODE VOLUME_MODE MACHINE_TYPE GUEST_USER IPAM_URL; do
+        for setting in VM_NAMESPACE EXECUTION_NAMESPACE NETWORK_ATTACHMENT DATASOURCE_NAME DATASOURCE_NAMESPACE STORAGE_CLASS ACCESS_MODE VOLUME_MODE MACHINE_TYPE GUEST_USER IPAM_URL; do
           [[ -n "${!setting:-}" && "${!setting}" != *REPLACE_ME* ]] || fail "missing site setting: $setting"
         done
         case "$ACCESS_MODE" in ReadWriteOnce|ReadWriteMany) ;; *) fail "unsupported ACCESS_MODE" ;; esac
         case "$VOLUME_MODE" in Filesystem|Block) ;; *) fail "unsupported VOLUME_MODE" ;; esac
         [[ "$MACHINE_TYPE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || fail "invalid MACHINE_TYPE"
         [[ "$GUEST_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$GUEST_USER" != root ]] || fail "invalid non-root GUEST_USER"
-        # Legacy false is harmless, but do not silently ignore a requested policy change.
         [[ "${CLOUD_USER_SUDO:-false}" == false ]] || fail "CLOUD_USER_SUDO is no longer supported; preserve the golden image account policy"
 
         # Parse labels as data, never shell code. Reject invalid input before IPAM.
@@ -178,7 +194,7 @@ spec:
           done
         fi
 
-        # Only an empty successful GET is 'not found'; authorization failures abort.
+        # An authorization/API failure is never interpreted as 'not found'.
         exists() {
           local found
           found=$(oc -n "$1" get "$2" "$3" --ignore-not-found -o name) \
@@ -200,10 +216,10 @@ spec:
             *) echo "$n" ;;
           esac
         }
-        exists "$VM_NAMESPACE" templates.template.openshift.io rhel-standard
+        # The trusted VM definition stays in the execution namespace.
+        exists "$EXECUTION_NAMESPACE" templates.template.openshift.io rhel-standard
         if (( ${#labels[@]} )); then
-          # Protect all labels already owned by the approved VM Template.
-          managed=$(oc -n "$VM_NAMESPACE" get templates.template.openshift.io rhel-standard \
+          managed=$(oc -n "$EXECUTION_NAMESPACE" get templates.template.openshift.io rhel-standard \
             -o go-template='{{range .objects}}{{if eq .kind "VirtualMachine"}}{{range $key, $value := .metadata.labels}}{{$key}}{{"\n"}}{{end}}{{end}}{{end}}') \
             || fail "cannot read Template-managed labels"
           while IFS= read -r key; do
@@ -211,9 +227,10 @@ spec:
             [[ -z "${label_keys[$key]+set}" ]] || fail "label $key is managed by the VM Template"
           done <<< "$managed"
         fi
+        # Approval is a scoped target RoleBinding for this central ServiceAccount.
+        can_i "$VM_NAMESPACE" create virtualmachines.kubevirt.io
         exists "$VM_NAMESPACE" virtualmachineinstancetypes.instancetype.kubevirt.io "poc-$REQ_SIZE"
         exists "$VM_NAMESPACE" network-attachment-definitions.k8s.cni.cncf.io "$NETWORK_ATTACHMENT"
-        can_i "$VM_NAMESPACE" create virtualmachines.kubevirt.io
         source=$(oc -n "$DATASOURCE_NAMESPACE" get datasources.cdi.kubevirt.io "$DATASOURCE_NAME" \
           --ignore-not-found \
           -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}|{.status.source.pvc.name}|{.status.source.pvc.namespace}') \
@@ -228,7 +245,6 @@ spec:
         [[ -n "$pvc" ]] || fail "source PVC not found"
         IFS='|' read -r phase src_class src_mode src_size <<< "$pvc"
         [[ "$phase" == Bound ]] || fail "source PVC is not Bound"
-        # Deliberately conservative MVP guard: not a general CDI limitation.
         [[ "$src_class" == "$STORAGE_CLASS" && "$src_mode" == "$VOLUME_MODE" ]] \
           || fail "source storage class/volume mode differs from approved target"
         src_bytes=$(bytes "$src_size") || fail "unrecognised source PVC capacity"
@@ -249,12 +265,13 @@ spec:
           done
           names+="$name"$'\n'
         done
-        # Canonical label arguments are read by create-vms, not reparsed from input.
         : > "$SCRATCH/labels"
         if (( ${#labels[@]} )); then printf '%s\n' "${labels[@]}" > "$SCRATCH/labels"; fi
         printf '%s' "$names" > "$SCRATCH/names"
         printf '%s\n' "$DISK_SIZE" > "$SCRATCH/disk-size"
-        echo "Preflight passed; no IPAM changes yet."
+        # Freeze the validated destination; later ConfigMap edits cannot move the VM.
+        printf '%s\n' "$VM_NAMESPACE" > "$SCRATCH/target-namespace"
+        echo "Preflight passed for VM namespace $VM_NAMESPACE; no IPAM changes yet."
     - name: reserve-ip
       image: $(params.ipam-image)
       volumeMounts:
@@ -299,6 +316,10 @@ spec:
           value: $(params.size)
         - name: REQ_SSH_KEY
           value: $(params.ssh-public-key)
+        - name: EXECUTION_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         - name: SCRATCH
           value: $(workspaces.scratch.path)
         - name: NETWORK_PROFILE_BOUND
@@ -312,9 +333,13 @@ spec:
             export "$key=$value"
           done < "$SCRATCH/network.env"
         fi
+        EXECUTION_NAMESPACE=${EXECUTION_NAMESPACE:-${VM_NAMESPACE:?missing site VM_NAMESPACE}}
+        [[ -s "$SCRATCH/target-namespace" ]] || { echo "Missing validated target namespace" >&2; exit 1; }
+        VM_NAMESPACE=$(< "$SCRATCH/target-namespace")
+        [[ "$VM_NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ && ${#VM_NAMESPACE} -le 63 ]] || { echo "Invalid target namespace snapshot" >&2; exit 1; }
         disk=$(< "$SCRATCH/disk-size")
         mapfile -t labels < "$SCRATCH/labels"
-        oc -n "$VM_NAMESPACE" get templates.template.openshift.io rhel-standard -o yaml > "$SCRATCH/template.yaml"
+        oc -n "$EXECUTION_NAMESPACE" get templates.template.openshift.io rhel-standard -o yaml > "$SCRATCH/template.yaml"
         [[ -s "$SCRATCH/allocations" ]] || { echo "No allocation receipt" >&2; exit 1; }
         while IFS='|' read -r name address mac gateway dns domain; do
           [[ -n "$name" && -n "$address" ]] || { echo "Invalid allocation receipt" >&2; exit 1; }
@@ -330,7 +355,6 @@ spec:
             -p "DNS_SERVERS=$dns" -p "DOMAIN=$domain" -p "SSH_PUBLIC_KEY=$REQ_SSH_KEY" \
             > "$SCRATCH/$name.yaml"
           if (( ${#labels[@]} )); then
-            # Local metadata edit: labels exist at creation, no live patch or RBAC change.
             if ! oc label --local --overwrite=false -f "$SCRATCH/$name.yaml" \
               -o yaml -- "${labels[@]}" > "$SCRATCH/$name.labeled.yaml"; then
               echo "FAILED: cannot add VM labels; reservations remain. Reconcile before retrying." >&2
@@ -339,7 +363,7 @@ spec:
             mv "$SCRATCH/$name.labeled.yaml" "$SCRATCH/$name.yaml"
           fi
           if ! oc -n "$VM_NAMESPACE" create -f "$SCRATCH/$name.yaml"; then
-            echo "FAILED: reservations remain. Inspect $name and reconcile before retrying." >&2
+            echo "FAILED: reservations remain. Inspect $VM_NAMESPACE/$name and reconcile before retrying." >&2
             exit 1
           fi
         done < "$SCRATCH/allocations"

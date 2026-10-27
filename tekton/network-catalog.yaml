@@ -1,15 +1,12 @@
 # ADMIN AUTHORING TEMPLATE: process locally; do not install this wrapper.
-# oc process --local -f tekton/network-catalog.yaml \
-#   -p NETWORK_ATTACHMENT=vlan-example -p REQUEST_TEMPLATE_NAME=vm-provision-vlan-example \
-#   -p 'DISPLAY_NAME=Provision VM on Example Network' -o yaml > site-networks/example.yaml
-# The output contains a ConfigMap and a request Template, NEVER a live PipelineRun.
+# Output: a disabled network ConfigMap and a catalog request Template, not a live run.
 apiVersion: template.openshift.io/v1
 kind: Template
 metadata:
   name: vm-network-catalog-entry
 parameters:
   - name: NETWORK_ATTACHMENT
-    description: Existing NAD name in the provisioning namespace.
+    description: Approved NAD name; must also exist in each chosen target VM namespace.
     required: true
   - name: REQUEST_TEMPLATE_NAME
     description: Unique request Template resource name; reuse the old name only for its migration.
@@ -18,6 +15,7 @@ parameters:
     description: Operator-facing catalog title.
     required: true
   - name: NAMESPACE
+    description: Central provisioning namespace, not the VM destination.
     value: vm-provisioning
     required: true
 objects:
@@ -30,7 +28,6 @@ objects:
         app.kubernetes.io/part-of: vm-pipelines
         vm-pipelines/network: ${NETWORK_ATTACHMENT}
     data:
-      # Leave disabled until all settings, permissions and trust are approved.
       PROFILE_ENABLED: "false"
       NETWORK_ATTACHMENT: ${NETWORK_ATTACHMENT}
       INFOBLOX_NETWORK: REPLACE_ME_IPV4_CIDR
@@ -41,8 +38,7 @@ objects:
       GATEWAY: REPLACE_ME_GATEWAY
       DNS_SERVERS: REPLACE_ME_COMMA_SEPARATED_DNS_IPS
       DOMAIN: REPLACE_ME_DNS_DOMAIN
-      # For networks without DHCP: keep both keys, set both values to "",
-      # and set DHCP_DISABLED to "true" after confirming with the network owner.
+      # For no DHCP, keep both keys empty and set DHCP_DISABLED to true after approval.
       DHCP_START: REPLACE_ME_FIRST_DHCP_IP
       DHCP_END: REPLACE_ME_LAST_DHCP_IP
       DHCP_DISABLED: "false"
@@ -59,7 +55,8 @@ objects:
         description: >-
           Provision one to five RHEL VMs on ${NETWORK_ATTACHMENT} using its approved
           Infoblox profile. Small 110Gi, medium 500Gi, large 1Ti root disks.
-          Network provisioning is blocked until the administrator enables the profile.
+          Keep the top Namespace selector on ${NAMESPACE}; use Target VM namespace
+          for the destination. Network provisioning stays blocked until enabled.
         tags: rhel,vm,virtualization,request,pipeline
         iconClass: icon-rhel
     objects:
@@ -89,6 +86,8 @@ objects:
               value: ${SSH_PUBLIC_KEY}
             - name: vm-labels
               value: ${VM_LABELS}
+            - name: target-namespace
+              value: ${TARGET_NAMESPACE}
     parameters:
       - name: VM_NAME
         displayName: VM name
@@ -113,3 +112,8 @@ objects:
         description: "Optional. Separate labels with semicolons: foo=bar;boo=far. Applied to every VM in the request."
         value: ""
         required: false
+      - name: TARGET_NAMESPACE
+        displayName: Target VM namespace
+        description: Existing approved VM destination with the selected NAD and instance types. Keep the top Namespace selector on ${NAMESPACE}.
+        value: ${NAMESPACE}
+        required: true

@@ -54,12 +54,13 @@ class NativeTests(unittest.TestCase):
             secrets = [x for x in step.get('envFrom', []) if 'secretRef' in x]
             self.assertEqual(bool(secrets), step['name'] == 'reserve-ip')
             self.assertNotIn('$(params.vm-labels)', step['script'])
+            self.assertNotIn('$(params.target-namespace)', step['script'])
         self.assertEqual({x['name']: x['value'] for x in task['spec']['stepTemplate']['env']},
                          {'HOME': '/tmp', 'DOCKER_CONFIG': '/tmp/.docker'})
         docs = list(yaml.safe_load_all((ROOT / 'tekton/serviceaccount.yaml').read_text()))
         self.assertFalse(any(x['kind'].startswith('Cluster') for x in docs))
         pipeline = yaml.safe_load((ROOT / 'tekton/pipeline.yaml').read_text())
-        self.assertEqual(len(pipeline['spec']['params']), 5)
+        self.assertEqual(len(pipeline['spec']['params']), 6)
         self.assertEqual(next(p for p in pipeline['spec']['params'] if p['name'] == 'vm-labels')['default'], '')
         self.assertEqual(next(p for p in task['spec']['params'] if p['name'] == 'vm-labels')['default'], '')
         self.assertIn({'name': 'vm-labels', 'value': '$(params.vm-labels)'}, pipeline['spec']['tasks'][0]['params'])
@@ -84,6 +85,7 @@ class NativeTests(unittest.TestCase):
             values = {p['name']: p['value'] for p in run['spec']['params']}
             self.assertEqual(values['ssh-public-key'], key)
             self.assertEqual(values['vm-labels'], labels or '')
+            self.assertEqual(values['target-namespace'], 'vm-provisioning')
             self.assertFalse(run['metadata'].get('labels'))
 
     def test_three_vm_sizes_and_embedded_cloud_init(self):
@@ -252,6 +254,7 @@ else: sys.exit(97)
             (p / 'bin').mkdir()
             (p / 'created').mkdir()
             (p / 'disk-size').write_text(disk + '\n')
+            (p / 'target-namespace').write_text(SITE['VM_NAMESPACE'] + '\n')
             (p / 'labels').write_text(''.join(x + '\n' for x in label_args))
             (p / 'allocations').write_text(
                 'web-001|192.0.2.33/24|02:11:22:33:44:55|192.0.2.1|192.0.2.2|example.test\n'
@@ -298,6 +301,7 @@ else:
                                     'vm-pipelines/size': size, 'vm-pipelines/os': 'rhel'}
                         expected.update(dict(x.split('=', 1) for x in labels))
                         self.assertEqual(vm['metadata']['name'], f'web-00{i}')
+                        self.assertEqual(vm['metadata']['namespace'], SITE['VM_NAMESPACE'])
                         self.assertEqual(vm['metadata']['labels'], expected)
                         self.assertEqual(vm['spec']['template']['metadata']['labels'], {'kubevirt.io/domain': f'web-00{i}'})
                         self.assertNotIn('labels', vm['spec']['dataVolumeTemplates'][0]['metadata'])

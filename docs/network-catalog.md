@@ -1,76 +1,48 @@
 # One catalog entry per network, one shared pipeline
 
-Use this after the initial installation in [runbook.md](runbook.md).
-This adds request Templates and non-secret network ConfigMaps, not more
-Pipelines, Tasks, VM Templates, namespaces, images, or controllers.
+Each request Template fixes a network profile. The operator supplies name, size,
+count, SSH key, optional labels and **Target VM namespace**. Keep the native
+form's top Namespace selector on the central provisioning namespace.
+No NAD dropdown, duplicate Pipeline/Task, or helper-image rebuild is needed.
 
-Each operator chooses a catalog entry, then sees the same five fields: name,
-size, count, SSH public key and optional VM labels. The entry fixes a read-only
-`network` workspace to its own ConfigMap. There is no NAD dropdown or sixth
-request parameter. The native page still says Instantiate Template / Create.
+For an existing five-field installation, first follow
+[target-namespaces.md](target-namespaces.md). Its offline form upgrade preserves
+all current display names and network workspace bindings without changing any
+ConfigMap. Updating this authoring file alone does not change installed forms.
 
-## What is shared and what belongs to each network
+## Shared and per-network settings
 
-The existing `vm-provision-config` supplies VM namespace, golden DataSource,
-storage, machine type, existing guest user, and the Infoblox HTTPS endpoint and
-WAPI version. Credentials stay in `vm-ipam-credentials`; private CA trust stays
-in `vm-ipam-ca`. The IPAM helper remains the already-built direct-Infoblox 0.3
-image. **No rebuild or new runtime RBAC is needed.**
+The central vm-provision-config supplies the default VM namespace, golden source,
+storage, machine type, guest account, Infoblox HTTPS endpoint and WAPI version.
+The request can override only the VM destination. Credentials remain in central
+vm-ipam-credentials; CA trust stays in vm-ipam-ca.
 
-A network ConfigMap contains its NAD, Infoblox subnet/views/pool, gateway, DNS,
-domain, DHCP declaration, and `PROFILE_ENABLED`. All of its network keys are
-mandatory; the two DHCP range values can be empty only when DHCP is absent.
-The shared ConfigMap's network values are overridden as one complete set.
-There is no fallback from an incomplete selected profile to another network.
+Each network ConfigMap defines the NAD, subnet/views/pool, gateway, DNS, domain,
+DHCP declaration and PROFILE_ENABLED. The selected profile must be complete:
+there is no fallback from a missing profile field to another network's values.
+Preflight snapshots the selected settings; IP allocation and VM creation use
+the same snapshot. Unknown keys cannot override namespaces, images or credentials.
+Wait for active requests to finish before editing any profile.
 
-Preflight snapshots the selected settings once. IP allocation and VM creation
-read that same snapshot, not a ConfigMap that may have changed between steps.
-Treat profile updates as administrator changes and wait for active requests to
-finish before editing them. Unknown profile keys cannot override images, guest
-accounts, namespaces, credentials or other process settings.
+The chosen NAD name is resolved in the **target VM namespace**. It must refer to
+the same approved VLAN/IPAM network there. Before use, enroll that target with
+its local NADs, three instance types and the scoped central-SA RoleBinding.
+See [target setup](target-namespaces.md#enroll-each-approved-target-once).
 
-The existing request Template still works without a network workspace and uses
-the original site configuration. This preserves a current single-network entry
-while more entries are added. To convert that entry too, generate a profile using
-its existing Template name; its direct form URL will remain valid.
+The legacy single-network request can omit the network workspace and use site
+configuration. That mode remains compatible. Its VM destination can now be
+selected independently too; an omitted target parameter uses VM_NAMESPACE.
 
-## 1. Update the shared definitions
+## Render a new, disabled profile and request entry
 
-Use the current main branch. Preserve your local Task image digests, renamed
-request display name and ignored site.yaml. In an existing main checkout:
-
-```sh
-git pull --ff-only --autostash origin main
-git status --short
-```
-
-Stop for any merge conflict. Do not reset/clean or replace your local Task with
-an upstream file containing image placeholders. Do not reapply site.yaml or the
-old request Template just to add other networks.
-
-After checking both image defaults still contain the approved digests, validate
-then update only the Task and Pipeline, with no provisioning requests running:
-
-```sh
-oc apply --dry-run=server -f tekton/task.yaml -f tekton/pipeline.yaml
-oc apply -f tekton/task.yaml -f tekton/pipeline.yaml
-```
-
-Optional ConfigMap workspaces are a native Tekton feature:
-https://tekton.dev/docs/pipelines/workspaces/
-Do not substitute parameters into envFrom names; that is not used here.
-
-## 2. Render a new entry and disabled network profile
-
-`tekton/network-catalog.yaml` is an **administrator authoring Template**.
-Process it locally; do not install the wrapper itself. Its output contains only
-one ConfigMap and one request Template. The PipelineRun inside that request
-Template remains a definition until an operator submits the form.
-
-Use the actual NAD name, a unique Template name, and a clear display name:
+tekton/network-catalog.yaml is an **administrator authoring Template**.
+Process it locally; do not install the wrapper. Its output contains one ConfigMap
+and one request Template, not a live PipelineRun. The parameter NAMESPACE selects
+the central namespace. TARGET_NAMESPACE belongs to the inner operator form.
 
 ```sh
 mkdir -p site-networks
+# Use a new output filename; do not overwrite approved local configuration.
 oc process --local -f tekton/network-catalog.yaml \
   -p NETWORK_ATTACHMENT=example-nad \
   -p REQUEST_TEMPLATE_NAME=vm-provision-example-nad \
@@ -78,73 +50,47 @@ oc process --local -f tekton/network-catalog.yaml \
   -o yaml > site-networks/example-nad.yaml
 ```
 
-Run this once per new network with different values and filenames. Refuse to
-overwrite a previously edited generated file; it may contain approved settings.
-The `site-networks/` directory is ignored by Git. Client NAD names and network
-settings must remain local, not committed to the public repository.
-
-A ConfigMap named `vm-network-example-nad` and request Template named
-`vm-provision-example-nad` are generated. They refer to the same network. The
-namespace defaults to vm-provisioning; use `-p NAMESPACE=...` only if the shared
-pipeline, NAD and configuration already live in that namespace.
-
-## 3. Install definitions, without submitting anything
-
-Inspect generated names and existing owners first; use new names for new entries.
-Then validate and install the generated files:
+The generated resource names are vm-network-example-nad and
+vm-provision-example-nad. The site-networks directory is ignored by Git. Keep
+real network names/settings local. New profiles start with PROFILE_ENABLED false.
+Inspect existing owners before installation; do not overwrite existing profiles
+with generated placeholders.
 
 ```sh
-oc apply --dry-run=server -f site-networks/
-oc apply -f site-networks/
+oc create --dry-run=server -f site-networks/example-nad.yaml &&
+oc create -f site-networks/example-nad.yaml
 ```
 
-**These commands do not allocate addresses or create VMs.** The entries are
-visible in the catalog, but `PROFILE_ENABLED: "false"` blocks the network path
-if a run is submitted. It does not disable the console's Create button. Missing
-credentials also prevent execution. Do not submit a request just to test the
-block; inspect the form only while Infoblox configuration is pending.
+This creates definitions only. Do not submit a request while Infoblox is pending.
+Disabled profiles still have a visible Create button; the Task refuses allocation.
 
-The four/five request inputs stay unchanged. The network choice is the catalog
-entry itself. A direct URL uses the new request Template name:
+## Configure and enable a profile later
 
-```text
-/catalog/instantiate-template?template=vm-provision-example-nad&template-ns=vm-provisioning&preselected-ns=vm-provisioning
+In the existing profile, supply the real subnet, DNS/network views, allocation
+bounds, gateway, DNS and domain. They must all describe the chosen NAD network.
+Keep DHCP_START and DHCP_END as keys. For no DHCP, set both values to empty
+strings and DHCP_DISABLED to true after confirming with the network owner.
+For DHCP present, set its real bounds and DHCP_DISABLED false.
+
+Use the existing approved credential/CA process. Only after configuration,
+permissions, TLS and routing checks should an administrator set PROFILE_ENABLED
+true for the selected profile. Do not enable all profiles merely to test one.
+Changing runtime settings/credentials/CA does not need another helper build.
+
+## Verify the forms
+
+```sh
+oc -n vm-provisioning get templates \
+  -o custom-columns='NAME:.metadata.name,TITLE:.metadata.annotations.openshift\.io/display-name'
 ```
 
-Old generic request Templates are not removed automatically. Do not change or
-delete an existing VLAN entry solely because you added another one.
+Choose vm-provisioning in the **catalog Project** selector to see these local
+entries. The native Instantiate Template page will show the same six inputs and
+list PipelineRun as the created resource. A golden-image VM Template that lists
+VirtualMachine is a different entry, not the pipeline request.
 
-## 4. Complete and enable each profile later
+The fixed profile is a convenience, not an authorization boundary. Restrict
+central task/pod/template edits to trusted operators. Cross-namespace permissions
+come from explicit target RoleBindings, not the visible form fields.
 
-In its generated file, edit the ConfigMap object's string-valued data:
-`INFOBLOX_NETWORK`, `INFOBLOX_NETWORK_VIEW`, `INFOBLOX_DNS_VIEW`, `STATIC_START`,
-`STATIC_END`, `GATEWAY`, `DNS_SERVERS`, `DOMAIN`, `DHCP_START`, `DHCP_END`, and
-`DHCP_DISABLED`. The generated NETWORK_ATTACHMENT already contains the NAD.
-
-For a network without DHCP, **retain both range keys with empty string values**
-and set `DHCP_DISABLED: "true"`. Do not omit the keys or assume the absence of
-DHCP merely because the requested VMs use static addresses.
-
-The shared site configuration must also have the real IPAM_URL and WAPI version,
-plus approved credential delivery, CA trust and proxy/egress settings. Confirm
-that the chosen NAD really connects to that subnet on all eligible nodes.
-
-Only after approval, set `PROFILE_ENABLED: "true"`, reapply that network's file,
-and approve one controlled VM request. Blank, missing and REPLACE_ME profile
-values fail closed before allocation. The helper validates actual IPv4, gateway,
-DNS, static/DHCP overlap and allocation responses as before.
-
-Do not regenerate a configured profile from the default example; that would
-reset it to disabled placeholders. Edit the local generated file instead.
-Hidden fields and fixed workspace bindings are convenience, not an authorization
-boundary against a user allowed to create arbitrary Pods/TaskRuns/PipelineRuns.
-Keep this service restricted to trusted platform operators.
-
-## Verification
-
-CI processes the authoring Template locally, then processes each generated
-request Template, and checks five inputs, fixed profile bindings, identity and
-labels. It also tests disabled/incomplete profiles, snapshot reuse through IPAM
-and VM creation, no fallback, and the original single-network path. API calls
-are mocked; installed behavior still requires a server dry-run and a controlled
-client test after Infoblox details arrive.
+Reference: https://tekton.dev/docs/pipelines/workspaces/
