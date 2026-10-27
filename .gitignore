@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .env
 site.yaml
+site-networks/
 *.key
 *.pem
 kubeconfig*

@@ -28,6 +28,10 @@ spec:
       default: REPLACE_ME_BUILT_IPAM_IMAGE_BY_DIGEST
   workspaces:
     - name: scratch
+    - name: network
+      optional: true
+      readOnly: true
+      description: A complete approved network profile. Omit only for legacy single-network requests.
   volumes:
     - name: ipam-ca
       configMap:
@@ -73,6 +77,10 @@ spec:
           value: $(params.vm-labels)
         - name: SCRATCH
           value: $(workspaces.scratch.path)
+        - name: NETWORK_PROFILE_BOUND
+          value: $(workspaces.network.bound)
+        - name: NETWORK_PROFILE_PATH
+          value: $(workspaces.network.path)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
@@ -90,6 +98,42 @@ spec:
           *) fail "count must be between 1 and 5" ;;
         esac
         [[ "$REQ_NAME" =~ ^[a-z][a-z0-9-]{0,54}[a-z0-9]$ ]] || fail "invalid VM name"
+
+        # Snapshot one complete network profile. Never fall back to the site's
+        # network values when a selected profile is missing, disabled or incomplete.
+        if [[ "${NETWORK_PROFILE_BOUND:-false}" == true ]]; then
+          profile=${NETWORK_PROFILE_PATH:?missing network workspace path}
+          # Pin one projected ConfigMap generation while reading its keys.
+          if [[ -L "$profile/..data" ]]; then
+            profile=$(readlink -f "$profile/..data") || fail "cannot resolve network profile"
+          fi
+          enabled=$(cat "$profile/PROFILE_ENABLED") || fail "missing PROFILE_ENABLED"
+          [[ "$enabled" == true ]] || fail "network profile is disabled pending administrator approval"
+          [[ ! -e "$SCRATCH/network.env" ]] || fail "network snapshot already exists; do not retry automatically"
+          umask 077
+          : > "$SCRATCH/network.env.tmp"
+          for key in NETWORK_ATTACHMENT INFOBLOX_NETWORK INFOBLOX_NETWORK_VIEW INFOBLOX_DNS_VIEW STATIC_START STATIC_END GATEWAY DNS_SERVERS DOMAIN DHCP_START DHCP_END DHCP_DISABLED; do
+            value=$(cat "$profile/$key") || fail "network profile is missing $key"
+            [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *REPLACE_ME* ]] || fail "invalid or placeholder network setting: $key"
+            case "$key" in
+              DHCP_START|DHCP_END) ;;
+              *) [[ -n "$value" ]] || fail "empty network setting: $key" ;;
+            esac
+            # Literal data, not shell source. Unknown profile keys are never exported.
+            printf '%s=%s\n' "$key" "$value" >> "$SCRATCH/network.env.tmp"
+            export "$key=$value"
+          done
+          [[ "$NETWORK_ATTACHMENT" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ && ${#NETWORK_ATTACHMENT} -le 63 ]] || fail "invalid profile NAD name"
+          case "$DHCP_DISABLED" in
+            true) [[ -z "$DHCP_START" && -z "$DHCP_END" ]] || fail "disabled DHCP conflicts with configured range" ;;
+            false) [[ -n "$DHCP_START" && -n "$DHCP_END" ]] || fail "DHCP range is required" ;;
+            *) fail "DHCP_DISABLED must be true or false" ;;
+          esac
+          mv "$SCRATCH/network.env.tmp" "$SCRATCH/network.env"
+        elif [[ "${NETWORK_PROFILE_BOUND:-false}" != false ]]; then
+          fail "invalid network workspace state"
+        fi
+
         for setting in VM_NAMESPACE NETWORK_ATTACHMENT DATASOURCE_NAME DATASOURCE_NAMESPACE STORAGE_CLASS ACCESS_MODE VOLUME_MODE MACHINE_TYPE GUEST_USER IPAM_URL; do
           [[ -n "${!setting:-}" && "${!setting}" != *REPLACE_ME* ]] || fail "missing site setting: $setting"
         done
@@ -227,10 +271,20 @@ spec:
           value: $(workspaces.scratch.path)/names
         - name: ALLOCATIONS_FILE
           value: $(workspaces.scratch.path)/allocations
+        - name: SCRATCH
+          value: $(workspaces.scratch.path)
+        - name: NETWORK_PROFILE_BOUND
+          value: $(workspaces.network.bound)
       script: |
         #!/usr/bin/env sh
         set -eu
         umask 077
+        if [ "${NETWORK_PROFILE_BOUND:-false}" = true ]; then
+          test -s "$SCRATCH/network.env" || { echo "Missing validated network snapshot" >&2; exit 1; }
+          while IFS='=' read -r key value; do
+            export "$key=$value"
+          done < "$SCRATCH/network.env"
+        fi
         if [ -f /etc/ipam-ca/ca-bundle.crt ]; then
           export SSL_CERT_FILE=/etc/ipam-ca/ca-bundle.crt
         fi
@@ -247,9 +301,17 @@ spec:
           value: $(params.ssh-public-key)
         - name: SCRATCH
           value: $(workspaces.scratch.path)
+        - name: NETWORK_PROFILE_BOUND
+          value: $(workspaces.network.bound)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
+        if [[ "${NETWORK_PROFILE_BOUND:-false}" == true ]]; then
+          [[ -s "$SCRATCH/network.env" ]] || { echo "Missing validated network snapshot" >&2; exit 1; }
+          while IFS='=' read -r key value; do
+            export "$key=$value"
+          done < "$SCRATCH/network.env"
+        fi
         disk=$(< "$SCRATCH/disk-size")
         mapfile -t labels < "$SCRATCH/labels"
         oc -n "$VM_NAMESPACE" get templates.template.openshift.io rhel-standard -o yaml > "$SCRATCH/template.yaml"

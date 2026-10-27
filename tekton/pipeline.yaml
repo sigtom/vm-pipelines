@@ -25,6 +25,9 @@ spec:
       description: "Optional VM labels separated by semicolons, e.g. foo=bar;boo=far. Applied to every VM in the request."
   workspaces:
     - name: scratch
+    - name: network
+      optional: true
+      description: Administrator-selected network ConfigMap, fixed by the catalog entry.
   tasks:
     - name: provision
       taskRef:
@@ -44,3 +47,5 @@ spec:
       workspaces:
         - name: scratch
           workspace: scratch
+        - name: network
+          workspace: network

@@ -1,0 +1,115 @@
+# ADMIN AUTHORING TEMPLATE: process locally; do not install this wrapper.
+# oc process --local -f tekton/network-catalog.yaml \
+#   -p NETWORK_ATTACHMENT=vlan-example -p REQUEST_TEMPLATE_NAME=vm-provision-vlan-example \
+#   -p 'DISPLAY_NAME=Provision VM on Example Network' -o yaml > site-networks/example.yaml
+# The output contains a ConfigMap and a request Template, NEVER a live PipelineRun.
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: vm-network-catalog-entry
+parameters:
+  - name: NETWORK_ATTACHMENT
+    description: Existing NAD name in the provisioning namespace.
+    required: true
+  - name: REQUEST_TEMPLATE_NAME
+    description: Unique request Template resource name; reuse the old name only for its migration.
+    required: true
+  - name: DISPLAY_NAME
+    description: Operator-facing catalog title.
+    required: true
+  - name: NAMESPACE
+    value: vm-provisioning
+    required: true
+objects:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: vm-network-${NETWORK_ATTACHMENT}
+      namespace: ${NAMESPACE}
+      labels:
+        app.kubernetes.io/part-of: vm-pipelines
+        vm-pipelines/network: ${NETWORK_ATTACHMENT}
+    data:
+      # Leave disabled until all settings, permissions and trust are approved.
+      PROFILE_ENABLED: "false"
+      NETWORK_ATTACHMENT: ${NETWORK_ATTACHMENT}
+      INFOBLOX_NETWORK: REPLACE_ME_IPV4_CIDR
+      INFOBLOX_NETWORK_VIEW: REPLACE_ME_NETWORK_VIEW
+      INFOBLOX_DNS_VIEW: REPLACE_ME_DNS_VIEW
+      STATIC_START: REPLACE_ME_FIRST_APPROVED_STATIC_IP
+      STATIC_END: REPLACE_ME_LAST_APPROVED_STATIC_IP
+      GATEWAY: REPLACE_ME_GATEWAY
+      DNS_SERVERS: REPLACE_ME_COMMA_SEPARATED_DNS_IPS
+      DOMAIN: REPLACE_ME_DNS_DOMAIN
+      # For networks without DHCP: keep both keys, set both values to "",
+      # and set DHCP_DISABLED to "true" after confirming with the network owner.
+      DHCP_START: REPLACE_ME_FIRST_DHCP_IP
+      DHCP_END: REPLACE_ME_LAST_DHCP_IP
+      DHCP_DISABLED: "false"
+  - apiVersion: template.openshift.io/v1
+    kind: Template
+    metadata:
+      name: ${REQUEST_TEMPLATE_NAME}
+      namespace: ${NAMESPACE}
+      labels:
+        app.kubernetes.io/part-of: vm-pipelines
+        vm-pipelines/network: ${NETWORK_ATTACHMENT}
+      annotations:
+        openshift.io/display-name: ${DISPLAY_NAME}
+        description: >-
+          Provision one to five RHEL VMs on ${NETWORK_ATTACHMENT} using its approved
+          Infoblox profile. Small 110Gi, medium 500Gi, large 1Ti root disks.
+          Network provisioning is blocked until the administrator enables the profile.
+        tags: rhel,vm,virtualization,request,pipeline
+        iconClass: icon-rhel
+    objects:
+      - apiVersion: tekton.dev/v1
+        kind: PipelineRun
+        metadata:
+          name: vm-request-${VM_NAME}
+        spec:
+          pipelineRef:
+            name: vm-provision
+          taskRunTemplate:
+            serviceAccountName: vm-provision
+          workspaces:
+            - name: scratch
+              emptyDir: {}
+            - name: network
+              configMap:
+                name: vm-network-${NETWORK_ATTACHMENT}
+          params:
+            - name: vm-name
+              value: ${VM_NAME}
+            - name: size
+              value: ${SIZE}
+            - name: count
+              value: ${COUNT}
+            - name: ssh-public-key
+              value: ${SSH_PUBLIC_KEY}
+            - name: vm-labels
+              value: ${VM_LABELS}
+    parameters:
+      - name: VM_NAME
+        displayName: VM name
+        description: Unused VM name or batch base name; lowercase letters, digits, hyphens.
+        required: true
+      - name: SIZE
+        displayName: Size
+        description: "small: 2 vCPU / 4Gi RAM / 110Gi disk; medium: 4 / 8Gi / 500Gi; large: 8 / 16Gi / 1Ti."
+        value: small
+        required: true
+      - name: COUNT
+        displayName: Count
+        description: Number of identical VMs (1-5)
+        value: "1"
+        required: true
+      - name: SSH_PUBLIC_KEY
+        displayName: SSH public key
+        description: An OpenSSH ed25519 public key for the existing approved guest account.
+        required: true
+      - name: VM_LABELS
+        displayName: Additional VM labels
+        description: "Optional. Separate labels with semicolons: foo=bar;boo=far. Applied to every VM in the request."
+        value: ""
+        required: false
