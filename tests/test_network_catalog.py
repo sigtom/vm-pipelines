@@ -13,13 +13,12 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 OC = shutil.which('oc')
 KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea'
-FIELDS = ('NETWORK_ATTACHMENT INFOBLOX_NETWORK INFOBLOX_NETWORK_VIEW INFOBLOX_DNS_VIEW '
-          'STATIC_START STATIC_END GATEWAY DNS_SERVERS DOMAIN DHCP_START DHCP_END DHCP_DISABLED').split()
+FIELDS = ('NETWORK_ATTACHMENT INFOBLOX_ALLOCATION_MODE INFOBLOX_NETWORK INFOBLOX_NETWORK_VIEW '
+          'GATEWAY DNS_SERVERS DOMAIN').split()
 PROFILE = dict(PROFILE_ENABLED='true', NETWORK_ATTACHMENT='vlan-101',
-               INFOBLOX_NETWORK='192.0.2.0/24', INFOBLOX_NETWORK_VIEW='network-view',
-               INFOBLOX_DNS_VIEW='dns-view', STATIC_START='192.0.2.32', STATIC_END='192.0.2.47',
-               GATEWAY='192.0.2.1', DNS_SERVERS='192.0.2.2,192.0.2.3', DOMAIN='example.test',
-               DHCP_START='', DHCP_END='', DHCP_DISABLED='true')
+               INFOBLOX_ALLOCATION_MODE='subnet', INFOBLOX_NETWORK='192.0.2.0/24',
+               INFOBLOX_NETWORK_VIEW='network-view', GATEWAY='192.0.2.1',
+               DNS_SERVERS='192.0.2.2,192.0.2.3', DOMAIN='example.test')
 SITE = dict(VM_NAMESPACE='vm-provisioning', NETWORK_ATTACHMENT='legacy-nad',
             DATASOURCE_NAME='rhel-golden', DATASOURCE_NAMESPACE='image-sources',
             STORAGE_CLASS='approved-storage', ACCESS_MODE='ReadWriteMany', VOLUME_MODE='Block',
@@ -153,6 +152,8 @@ else: sys.exit(97)
             self.assertEqual(config['data']['NETWORK_ATTACHMENT'], nad)
             self.assertEqual(config['data']['PROFILE_ENABLED'], 'false')
             self.assertTrue(set(FIELDS) <= set(config['data']))
+            self.assertEqual(config['data']['INFOBLOX_ALLOCATION_MODE'], 'subnet')
+            self.assertFalse(set(config['data']) & {'INFOBLOX_DNS_VIEW', 'STATIC_START', 'DHCP_START'})
             self.assertEqual(form['metadata']['name'], entry)
             self.assertEqual(form['metadata']['annotations']['openshift.io/display-name'], f'Provision VM on VLAN {number}')
             self.assertEqual([p['name'] for p in form['parameters']],
@@ -193,10 +194,11 @@ else: sys.exit(97)
 
     def test_missing_blank_placeholder_and_multiline_profile_do_not_fall_back(self):
         cases = [dict(PROFILE, GATEWAY=''), dict(PROFILE, DOMAIN='REPLACE_ME_DOMAIN'),
-                 dict(PROFILE, INFOBLOX_DNS_VIEW='view\nBAD=setting'),
+                 dict(PROFILE, INFOBLOX_NETWORK_VIEW='view\nBAD=setting'),
                  dict(PROFILE, NETWORK_ATTACHMENT='other/namespace'),
-                 dict(PROFILE, DHCP_START='192.0.2.50'),
-                 {key: value for key, value in PROFILE.items() if key != 'INFOBLOX_NETWORK'}]
+                 dict(PROFILE, INFOBLOX_ALLOCATION_MODE='range'),
+                 {key: value for key, value in PROFILE.items() if key != 'INFOBLOX_NETWORK'},
+                 {key: value for key, value in PROFILE.items() if key != 'INFOBLOX_ALLOCATION_MODE'}]
         for data in cases:
             with self.subTest(data=data):
                 self.write_profile(data)
@@ -206,19 +208,20 @@ else: sys.exit(97)
                 self.assertFalse((self.scratch / 'network.env').exists())
 
     def test_profile_data_is_not_executed_and_unknown_keys_not_exported(self):
-        self.write_profile(dict(PROFILE, INFOBLOX_DNS_VIEW='$(touch unexpected)', PATH='/bad/path',
-                                VM_NAMESPACE='not-approved', EXECUTION_NAMESPACE='not-central'))
+        self.write_profile(dict(PROFILE, INFOBLOX_NETWORK_VIEW='$(touch unexpected)', PATH='/bad/path',
+                                VM_NAMESPACE='not-approved', EXECUTION_NAMESPACE='not-central',
+                                INFOBLOX_DNS_VIEW='obsolete', STATIC_START='obsolete'))
         run = self.run_step('preflight')
         self.assertEqual(run.returncode, 0, run.stderr)
         run = self.run_step('reserve-ip')
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertFalse((self.root / 'unexpected').exists())
         snapshot = (self.scratch / 'network.env').read_text()
-        for key in ('PATH=', 'VM_NAMESPACE=', 'EXECUTION_NAMESPACE='):
+        for key in ('PATH=', 'VM_NAMESPACE=', 'EXECUTION_NAMESPACE=', 'INFOBLOX_DNS_VIEW=', 'STATIC_START='):
             self.assertNotIn(key, snapshot)
         self.assertEqual((self.scratch / 'target-namespace').read_text().strip(), 'vm-provisioning')
         env = json.loads((self.scratch / 'helper-env.json').read_text())
-        self.assertEqual(env['INFOBLOX_DNS_VIEW'], '$(touch unexpected)')
+        self.assertEqual(env['INFOBLOX_NETWORK_VIEW'], '$(touch unexpected)')
 
     def test_bound_profile_cannot_run_later_steps_without_snapshot(self):
         for name in ('reserve-ip', 'create-vms'):
@@ -273,7 +276,6 @@ else: sys.exit(97)
         for kind in ('network-attachment-definitions.', 'virtualmachineinstancetypes.', 'virtualmachines.', 'datavolumes.'):
             self.assertIn("'-n', 'team-apps', 'get', '" + kind, calls)
         self.assertNotIn("'get', 'namespaces'", calls)
-        # A later ConfigMap default change must not change the validated destination.
         self.env['VM_NAMESPACE'] = 'changed-default'
         self.assertEqual(self.run_step('reserve-ip').returncode, 0)
         created = self.run_step('create-vms')

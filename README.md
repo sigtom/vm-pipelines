@@ -1,109 +1,116 @@
 # VM Pipelines
 
-**Tekton calls Infoblox NIOS directly. No AAP service, token, job template, or
-network-allocation playbook is required.**
+**Tekton calls Infoblox directly for IPAM-only allocation. No AAP, DNS record
+creation, DHCP reservation, or MAC registration is used.**
 
-Operators request a VM name, size, count, SSH public key, optional labels, and
-**Target VM namespace**. A per-network catalog entry fixes the NAD/IPAM profile.
-The pipeline reserves addresses, processes a native OpenShift VM Template, and
-creates VMs through the Kubernetes API. Individual VMs are not written to Git.
+Operators supply name, size, count, SSH key, labels and Target VM namespace.
+A per-network catalog entry fixes the NAD and network profile. Requests run in
+vm-provisioning; VMs and disks go to the approved target namespace.
 
 ```text
-Catalog request runs centrally in vm-provisioning
-  -> validate target namespace, permissions, local NAD, instance type and source
-  -> direct Infoblox allocation
-  -> oc process + oc label --local + oc create in the target VM namespace
-  -> CDI disk clone -> guest cloud-init
+Catalog request -> target/network/storage preflight
+  -> GET host by short name and network view
+  -> POST IPAM-only host using next available IP from the configured subnet
+  -> GET created record, verify identity/address and DNS/DHCP disabled
+  -> native VM Template + labels -> Kubernetes API -> CDI clone -> cloud-init
 ```
 
-**Existing deployments:** follow [target-namespaces.md](docs/target-namespaces.md)
-to update the shared Task/Pipeline and all installed request forms without
-resetting network profiles, display names, credentials or local image digests.
-Keep the native form's top **Namespace** selector on **vm-provisioning**. Use
-**Target VM namespace** for the VM destination; this field is text, not a dropdown.
+**Upgrade required: helper vm-ipam:0.4.** Version 0.3 used DNS-enabled host records
+and range-based allocation; 0.2 called AAP. Rebuild the helper and update the
+Task digest and network profiles together. The Task rejects older helpers before
+allocation. Follow **[the IPAM-only upgrade](docs/ipam-only-upgrade.md)**.
+No existing VM, disk or Infoblox record is changed by a repository update.
 
-The helper stays at **vm-ipam:0.3** (direct Infoblox). Its script, Containerfile,
-build and IPAM contract have not changed for multi-namespace support. Reuse the
-already-built digest; **no helper rebuild**. Never use the old 0.2 AAP image.
+## Allocation contract
+
+The API payload matches the successful IPAM-only test (documentation values):
+
+```json
+{
+  "name": "vm-01",
+  "network_view": "default",
+  "configure_for_dns": false,
+  "ipv4addrs": [{
+    "ipv4addr": "func:nextavailableip:192.0.2.0/25,default",
+    "configure_for_dhcp": false
+  }]
+}
+```
+
+Use the actual approved network/view, not these example values. No DNS view,
+DNS domain, MAC or explicit free-IP list is sent. Readback accepts encoded host
+references such as /%20 without decoding/re-encoding them. It checks the short
+name, network view, DNS/DHCP flags, and one usable IP in the configured subnet.
+The receipt remains `name|ip/prefix|mac|gateway|dns1,dns2|domain`.
+
+**INFOBLOX_ALLOCATION_MODE must explicitly be subnet.** This selects from the
+whole subnet, not the obsolete STATIC_START/END range. Infoblox administrators
+must approve that scope and reserve/exclude gateway, infrastructure, DHCP-owned
+and otherwise unavailable addresses in IPAM. No local scan, range creation or
+fallback broadening occurs. An empty /range result is not evidence of no DHCP.
+DNS/DHCP false applies to the new host, not the whole subnet.
+
+Gateway, guest resolver IPs, search domain and prefix remain administrator-supplied.
+A MAC is generated once for the VM and logged; it is not stored in Infoblox.
+Names must be unique in the selected network view across target namespaces.
+DNS registration outside Infoblox remains a separate client workflow.
 
 ## Scope and sizes
 
-| Size | vCPU | Memory | Root disk request |
+| Size | vCPU | Memory | Root disk |
 | --- | ---: | ---: | ---: |
 | small | 2 | 4 GiB | 110Gi |
 | medium | 4 | 8 GiB | 500Gi |
-| large | 8 | 16 GiB | 1Ti (1024 GiB) |
+| large | 8 | 16 GiB | 1Ti |
 
-Disk sizes use binary Kubernetes quantities. A 104Gi golden source fits all
-three. Preflight rejects a target disk smaller than the source. These are PVC/
-virtual disk capacities, not a promise that guest LVM/filesystems grow automatically.
+Binary quantities accommodate a 104Gi source. Guest filesystem/LVM growth is a
+separate policy; a larger PVC does not prove a larger root filesystem.
+The approved golden image uses BIOS/VirtIO and an explicitly configured machine
+type. Cloud-init adds the supplied key to an existing non-root account without
+changing password, groups, sudo or sshd policy. See [golden-image.md](docs/golden-image.md).
 
-Native VM Template and instance types, one approved RHEL golden DataSource,
-BIOS/VirtIO, an approved MACHINE_TYPE, one bridged NIC, static IPv4, requests for
-1-5 VMs, and an existing non-root SSH account remain. No custom VM generator,
-runtime Git checkout, Ansible installation, SDK, or runtime pip install is used.
+The six-field forms, network workspace snapshots, 1-5 VM batches, labels and
+approved-target routing remain. Individual VMs are not stored in Git. There is
+no VM YAML generator, runtime Ansible, SDK or runtime pip installation.
 
-**Central versus target:** Task/Pipeline, rhel-standard Template, configuration,
-network profiles and credentials stay central. Each target needs an existing
-namespace, the same approved NAD names, the three namespaced instance types,
-and a scoped RoleBinding for the central ServiceAccount. No duplicate pipeline
-or copied IPAM Secret is needed. See [target setup](docs/target-namespaces.md).
+## Setup
 
-**Guest account policy stays with the image.** Cloud-init uses users: [] and a
-key-only first-boot command to append the supplied public key to the existing
-account's home. It does not create accounts, change password lock state, add
-groups/sudo, or rewrite sshd policy. Existing keys remain. The account must
-already exist and be allowed by guest SSH policy. CLOUD_USER_SUDO/SUDO_POLICY
-are obsolete. See [golden-image.md](docs/golden-image.md).
+For fresh installation use [runbook.md](docs/runbook.md). For network entries see
+[network-catalog.md](docs/network-catalog.md); for each new destination follow
+[target-namespaces.md](docs/target-namespaces.md).
 
-**Reference implementation, not a turnkey production service.** Target OpenShift
-Virtualization 4.21+ and Pipelines serving tekton.dev/v1. Offline tests do not
-prove the client's permissions, Infoblox, storage clone or guest boot work.
-
-The helper creates Infoblox DNS host records, not DHCP fixed-address reservations.
-The generated MAC configures the guest NIC, not a DHCP reservation. Gateway/DNS/
-pool settings are approved admin configuration, not automatically discovered.
-Multi-NIC, AD, Salt, subscriptions and agent enrollment remain separate work.
-
-## Configuration
-
-Start with [runbook.md](docs/runbook.md). Copy config/site.example.yaml to ignored
-site.yaml. Keep client settings and credentials out of this public repository.
-
-| File or resource | Purpose |
+| Resource | Location / purpose |
 | --- | --- |
-| config/site.example.yaml | Default VM destination, golden source, storage, machine type, guest account and direct Infoblox settings. |
-| tekton/task.yaml | Approved CLI/helper image digests and shared provisioning logic. |
-| tekton/network-catalog.yaml | Admin authoring Template for a disabled network profile and request form. |
-| tekton/target-namespace.yaml | Admin authoring Template for scoped target RBAC and instance types. |
-| scripts/add-target-namespace.py | Offline additive upgrade of existing request forms; not runtime helper code. |
-| tekton/serviceaccount.yaml | Central identity and source-image access. |
-| Secret vm-ipam-credentials | INFOBLOX_USERNAME / INFOBLOX_PASSWORD, outside Git. |
-| Optional ConfigMap vm-ipam-ca | Approved trust bundle in ca-bundle.crt. |
+| Pipeline, Task, rhel-standard Template, ServiceAccount | Central vm-provisioning namespace. |
+| vm-provision-config | Shared image/storage/account/API configuration. |
+| vm-network-<NAD> | Central per-network profile; initially disabled. |
+| vm-ipam-credentials | Central Secret: INFOBLOX_USERNAME and INFOBLOX_PASSWORD. |
+| vm-ipam-ca | Optional approved CA bundle, key ca-bundle.crt. TLS is always verified. |
+| Target namespace | Its NADs, poc-small/medium/large and scoped central-SA RoleBinding. |
+| tekton/ipam-check.yaml | Admin-only authoring Template for a GET-only connectivity TaskRun. |
 
-The five network entries use the same shared pipeline. Profile updates are
-administrator operations. NADs must describe the same network in every enrolled
-target. Names must remain unique in the selected Infoblox DNS view/domain.
+Keep client settings in ignored site.yaml/site-networks, never in public Git.
+Runtime connection/credential/CA changes after the 0.4 build do not require
+another build. Registry trust and API TLS trust are separate.
 
 ## Operator path
 
-Select project vm-provisioning -> Software Catalog -> the desired Provision VM
-network entry -> Instantiate Template. Keep the top Namespace on vm-provisioning.
-Enter the VM name, size, count, key, optional labels and target VM namespace.
-The request fixes the Pipeline, central ServiceAccount and workspaces.
-Track PipelineRuns centrally; view resulting VMs in their target namespace.
+Select project vm-provisioning -> Software Catalog -> Provision VM on the desired
+network -> Instantiate Template. Keep the top Namespace on vm-provisioning;
+use Target VM namespace for the VM destination. The intended form lists a
+PipelineRun, not a VirtualMachine, as the resource it will create.
 
-Labels use foo=bar;boo=far. Invalid labels, duplicate keys and attempts to replace
-Template-owned labels fail before IP allocation. Labels apply to VM metadata
-before creation, not to the VMI, disks or PipelineRun. Empty values are valid;
-trailing semicolons are not. Existing VMs are never modified by a request update.
+Size is a text field: small, medium or large. Labels are optional, e.g.
+foo=bar;boo=far. Invalid/duplicate/Template-owned labels fail before allocation.
+Labels are applied to VM metadata, not VMI/disks. Follow runs centrally, VMs in
+the target. The shared pipeline does not impersonate the requesting human.
 
-Use **trusted platform operators only**. The central SA's target RoleBindings
-set the allowed destinations. Requests do not impersonate the human operator;
-any allowed requester can choose any target permitted to that SA. Hidden fields
-are not an authorization boundary. Arbitrary Pod/TaskRun rights can expose Secrets.
+**Trusted platform operators only:** target RoleBindings determine the central
+SA's allowed destinations. Hidden fields are not an authorization boundary;
+arbitrary Pod/TaskRun or Template edits can expose credentials. No cluster-admin
+grant is needed for the provisioning SA. Check non-admin use separately.
 
-## Validation and operations
+## Validation and recovery
 
 ```sh
 python3 -m pip install PyYAML==6.0.3  # Tests only.
@@ -111,13 +118,13 @@ python3 -m unittest discover -s tests -v
 python3 -S -m unittest discover -s tests -p test_ipam.py -v
 ```
 
-CI requires oc for actual native rendering, local labels and Kustomize. Tests
-cover target routing/denial, local NAD checks, preserved network profiles,
-request-form upgrades, disk sizes, guest key handling and mocked IPAM calls.
-No live API allocation or client-cluster access is performed by these tests.
+The helper uses only the standard library and Python 3.9-compatible syntax;
+the cluster image uses UBI Python 3.12. CI uses real oc for native rendering and
+mocks external APIs. It does not prove the client's API TLS, pods, CSI clone or
+guest boot. Use the GET-only cluster check, then one approved small VM.
 
-**Pipeline success means VM resources were created, not that guests are ready.**
-Verify CDI, VM Ready, cloud-init, unique identities, DNS, SSH and filesystem
-capacity. No automatic retries, cleanup or rollback: preserve logs and reconcile
-existing records/disks after a failure. Keep Infoblox placeholders/profile gates
-unchanged until the network team supplies and approves the real settings.
+**No automatic retries or deletions.** A failed/timed-out POST may have created a
+host. Capture ALLOCATING/RESERVED log lines, its reference and receipt; reconcile
+before another request. Partial batches may leave allocations without VMs.
+emptyDir is temporary, not a durable recovery database. Pipeline success means
+VM creation, not guest readiness or completed AD/Salt/agent hardening.

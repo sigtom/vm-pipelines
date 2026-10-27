@@ -30,18 +30,13 @@ objects:
     data:
       PROFILE_ENABLED: "false"
       NETWORK_ATTACHMENT: ${NETWORK_ATTACHMENT}
+      # Explicit opt-in for the entire subnet; Infoblox owns availability/exclusions.
+      INFOBLOX_ALLOCATION_MODE: subnet
       INFOBLOX_NETWORK: REPLACE_ME_IPV4_CIDR
       INFOBLOX_NETWORK_VIEW: REPLACE_ME_NETWORK_VIEW
-      INFOBLOX_DNS_VIEW: REPLACE_ME_DNS_VIEW
-      STATIC_START: REPLACE_ME_FIRST_APPROVED_STATIC_IP
-      STATIC_END: REPLACE_ME_LAST_APPROVED_STATIC_IP
       GATEWAY: REPLACE_ME_GATEWAY
       DNS_SERVERS: REPLACE_ME_COMMA_SEPARATED_DNS_IPS
       DOMAIN: REPLACE_ME_DNS_DOMAIN
-      # For no DHCP, keep both keys empty and set DHCP_DISABLED to true after approval.
-      DHCP_START: REPLACE_ME_FIRST_DHCP_IP
-      DHCP_END: REPLACE_ME_LAST_DHCP_IP
-      DHCP_DISABLED: "false"
   - apiVersion: template.openshift.io/v1
     kind: Template
     metadata:
@@ -54,7 +49,7 @@ objects:
         openshift.io/display-name: ${DISPLAY_NAME}
         description: >-
           Provision one to five RHEL VMs on ${NETWORK_ATTACHMENT} using its approved
-          Infoblox profile. Small 110Gi, medium 500Gi, large 1Ti root disks.
+          IPAM-only Infoblox profile. Small 110Gi, medium 500Gi, large 1Ti root disks.
           Keep the top Namespace selector on ${NAMESPACE}; use Target VM namespace
           for the destination. Network provisioning stays blocked until enabled.
         tags: rhel,vm,virtualization,request,pipeline

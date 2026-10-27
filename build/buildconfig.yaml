@@ -1,4 +1,4 @@
-# Manual binary build. 0.3 restores direct Infoblox; 0.2 contained the AAP caller.
+# Manual binary build. 0.4 uses IPAM-only host records and subnet allocation.
 apiVersion: image.openshift.io/v1
 kind: ImageStream
 metadata:
@@ -25,5 +25,5 @@ spec:
   output:
     to:
       kind: ImageStreamTag
-      name: vm-ipam:0.3
+      name: vm-ipam:0.4
   triggers: []

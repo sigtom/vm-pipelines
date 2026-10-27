@@ -1,0 +1,70 @@
+# ADMIN ONLY: oc process this locally, then create the resulting TaskRun.
+# Performs GET-only helper checks; no VM, allocation or DNS/DHCP record is created.
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: vm-ipam-readonly-check
+parameters:
+  - name: HELPER_IMAGE
+    description: Newly built vm-ipam:0.4 image reference pinned by digest.
+    required: true
+  - name: NETWORK_CONFIGMAP
+    description: Existing per-network ConfigMap in the provisioning namespace.
+    required: true
+  - name: VM_NAME
+    description: Unused short hostname for the read-only duplicate check.
+    required: true
+  - name: NAMESPACE
+    value: vm-provisioning
+    required: true
+objects:
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    metadata:
+      generateName: ipam-readonly-check-
+      namespace: ${NAMESPACE}
+    spec:
+      serviceAccountName: vm-provision
+      timeout: 5m
+      taskSpec:
+        volumes:
+          - name: ipam-ca
+            configMap:
+              name: vm-ipam-ca
+              optional: true
+        steps:
+          - name: check
+            image: ${HELPER_IMAGE}
+            envFrom:
+              - configMapRef:
+                  name: vm-provision-config
+              - configMapRef:
+                  name: ${NETWORK_CONFIGMAP}
+              - secretRef:
+                  name: vm-ipam-credentials
+            env:
+              - name: HOME
+                value: /tmp
+              - name: DOCKER_CONFIG
+                value: /tmp/.docker
+              - name: CHECK_VM_NAME
+                value: ${VM_NAME}
+            volumeMounts:
+              - name: ipam-ca
+                mountPath: /etc/ipam-ca
+                readOnly: true
+            securityContext:
+              runAsNonRoot: true
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: [ALL]
+              seccompProfile:
+                type: RuntimeDefault
+            script: |
+              #!/usr/bin/env sh
+              set -eu
+              test "$(python3 /opt/vm/ipam.py --version)" = "vm-ipam 0.4: IPAM-only subnet allocation"
+              if [ -f /etc/ipam-ca/ca-bundle.crt ]; then
+                export SSL_CERT_FILE=/etc/ipam-ca/ca-bundle.crt
+              fi
+              python3 /opt/vm/ipam.py check-ipam "$CHECK_VM_NAME"

@@ -3,31 +3,31 @@
 The PipelineRun, Task, ServiceAccount, helper image, configuration, network
 profiles, credentials and rhel-standard Template stay in **vm-provisioning**.
 Only VMs and their generated DataVolumes/PVCs go to the chosen destination.
-No second pipeline, controller, helper build or Infoblox credential copy is needed.
+No second pipeline, controller or Infoblox credential copy is needed.
+
+**Current helper: 0.4.** Complete [the IPAM-only upgrade](ipam-only-upgrade.md)
+when moving from 0.3: that helper-code change requires one rebuild. Adding a
+target namespace after the 0.4 upgrade does not require another image build.
 
 ## Operator form
 
 Keep the native form's top **Namespace** selector on **vm-provisioning**.
-Use the new **Target VM namespace** text field for the VM destination.
-All five network catalog entries retain their fixed NAD/IPAM profile and their
-existing name, size, count, SSH key and labels inputs. There are now six inputs.
-The default target is the provisioning namespace. CLI requests that omit the
-new `target-namespace` parameter preserve the site's `VM_NAMESPACE` default.
-Do not edit that shared ConfigMap for each request.
+Use **Target VM namespace** for the VM destination. All network catalog entries
+retain their name, size, count, SSH key, labels and fixed NAD/profile binding.
+There are six text inputs. CLI requests omitting target-namespace preserve the
+site VM_NAMESPACE default. Do not edit that shared default for each request.
 
-The chosen NAD name must exist in the target namespace and refer to the same
-VLAN as the approved central network profile. A matching name alone does not
-prove equivalent NAD/node-bridge/uplink configuration. Review network setup in
-each target. No namespace prefix is added to the Infoblox hostname: DNS names
-must remain unique in the selected DNS view/domain, even across namespaces.
+The selected NAD must exist in the target and describe the same VLAN as the
+central profile. A matching name alone does not prove network equivalence.
+No namespace prefix is added to the IPAM host's short name: names must remain
+unique within the selected Infoblox network view, even across namespaces.
+This workflow creates no DNS records.
 
-## Upgrade the existing installation
+## Upgrade an older five-field installation
 
-Do not submit requests during the update. Let existing runs finish or investigate
-them before proceeding. This upgrade does not change source disks, existing VMs,
-network ConfigMaps, credentials or the built helper. It is not a live VM migration.
-
-From the existing main checkout, preserve local image/display-name edits:
+Pause submissions and investigate active requests before changing definitions.
+This upgrade leaves source disks, VMs, network ConfigMaps and credentials alone.
+From the existing main checkout, preserve local image/display-name changes:
 
 ```sh
 cd ~/vm-pipelines-rhel9
@@ -37,23 +37,18 @@ git diff --name-only --diff-filter=U
 grep -A2 -E 'name: (cli-image|ipam-image)$' tekton/task.yaml
 ```
 
-Stop on merge conflicts or image placeholders. Do not reset/clean the checkout.
-Keep the locally selected CLI and direct vm-ipam:0.3 digest references. Do not
-apply upstream files with placeholder defaults over the running Task.
-
-Update the shared execution definitions only:
+Stop for conflicts/placeholders. The Task must reference the built 0.4 digest,
+not the old DNS-enabled 0.3 image. Complete its build/config upgrade first.
 
 ```sh
 oc apply --dry-run=server -f tekton/task.yaml -f tekton/pipeline.yaml &&
 oc apply -f tekton/task.yaml -f tekton/pipeline.yaml
 ```
 
-Existing request Templates were generated earlier, so updating the authoring
-file alone cannot change the five installed forms. Use the small **offline**
-upgrade script below. It reads JSON and adds just the new parameter/binding to
-Templates that create vm-provision PipelineRuns. It preserves their names,
-custom display names, old fields, ServiceAccount and fixed network workspaces.
-It emits no ConfigMaps and skips the underlying VM/golden-image Templates.
+The authoring Template does not update already-generated forms. This offline
+script adds only the missing target field/binding while preserving names,
+display names, existing inputs, ServiceAccount and network workspaces. It skips
+underlying VM/golden-image Templates and emits no ConfigMaps.
 
 ```sh
 umask 077
@@ -66,43 +61,31 @@ oc apply -f "$backup/templates.updated.json"
 printf 'Request Template backup: %s\n' "$backup"
 ```
 
-Python 3 is only required on the admin jump host for this one-time JSON edit;
-there is no new runtime image dependency. No API calls occur inside the script.
-Resource versions are retained so concurrent updates fail rather than silently
-being overwritten. On a conflict, fetch a fresh snapshot and inspect the change.
-Do not rerun stale apply output to bypass a conflict.
-
-The shared rhel-standard VM Template and source-image RBAC need no changes.
-The old ignored `site-networks/` YAML files still represent their earlier form
-version. Do not blindly reapply them: either update their Template objects with
-the new field/binding, or repeat this additive form-upgrade after reapplying them.
-Do not regenerate/overwrite their ConfigMaps just to update request forms.
-
-Inspect an installed form without starting a request:
+Python 3 is needed only on the admin jump host for this JSON edit. There are no
+API calls in the script. Retained resource versions make concurrent changes
+fail; refresh and review rather than bypass a conflict. Do not blindly reapply
+older site-networks files that lack the new field or contain obsolete profiles.
 
 ```sh
 oc -n vm-provisioning get template vm-provision-request \
   -o jsonpath='{range .parameters[*]}{.name}{"\t"}{.displayName}{"\n"}{end}'
 ```
 
-Expect TARGET_NAMESPACE / Target VM namespace in addition to the original five
-fields. Reload the browser form. Do not click Create before Infoblox is ready.
+Expect TARGET_NAMESPACE / Target VM namespace plus the previous five inputs.
+This inspection does not submit a request.
 
 ## Enroll each approved target once
 
-The platform team creates the destination namespace and its NADs through its
-normal process. This repository does not create or copy either automatically.
-Review existing resources/owners before applying the target setup, especially
-poc-small, poc-medium and poc-large if they are already managed by another app.
+The platform team creates the target namespace and its approved NADs through
+its normal process. This repository does not automatically create/copy them.
+Inspect owners of existing poc-small/medium/large and RBAC before applying.
 
-The admin authoring Template `tekton/target-namespace.yaml` produces only a
-namespace-scoped Role, RoleBinding and the three namespaced instance types. The
-RoleBinding names **vm-provisioning/vm-provision**, not a ServiceAccount in the
-target. No target Secret, Pipeline/Task, source disk, or source clone grant is
-created. The existing central SA's source-image RoleBinding remains in place.
+tekton/target-namespace.yaml produces a namespace-scoped Role, RoleBinding and
+three namespaced instance types. The RoleBinding names the central
+vm-provisioning/vm-provision ServiceAccount, not a target ServiceAccount.
+No target Secret, Pipeline/Task, source disk or new source-image grant is created.
 
 ```sh
-# Use a real, approved existing namespace; do not enter a system namespace.
 read -r -p 'Approved target namespace: ' TARGET_NS
 oc get namespace "$TARGET_NS"
 oc -n "$TARGET_NS" get network-attachment-definitions.k8s.cni.cncf.io
@@ -110,16 +93,14 @@ oc -n "$TARGET_NS" get network-attachment-definitions.k8s.cni.cncf.io
 oc process --local -f tekton/target-namespace.yaml \
   -p "TARGET_NAMESPACE=$TARGET_NS" \
   -p PROVISIONING_NAMESPACE=vm-provisioning -o yaml > /tmp/vm-target-setup.yaml
-# Review this file and existing ownership before continuing.
+# Review the rendered resources and existing ownership first.
 oc apply --dry-run=server -f /tmp/vm-target-setup.yaml &&
 oc apply -f /tmp/vm-target-setup.yaml
 ```
 
-Do not apply this setup to kube-*, openshift*, default, or unapproved projects.
-The provisioning Task rejects default, openshift, openshift-* and kube-* targets.
-The template itself is an administrator tool, not a policy or user entry point.
-
-Check the effective runtime permissions and actual local resources:
+Do not apply to unapproved/system projects. The Task rejects default, openshift,
+openshift-* and kube-* targets. The setup Template is an administrator tool,
+not an admission policy or user-facing entry point.
 
 ```sh
 SA=system:serviceaccount:vm-provisioning:vm-provision
@@ -130,31 +111,24 @@ oc -n "$TARGET_NS" get virtualmachineinstancetypes.instancetype.kubevirt.io \
   poc-small poc-medium poc-large --as="$SA"
 ```
 
-The source DataSource/PVC checks still happen in their real source namespace;
-preflight checks source clone authorization with the same central identity.
-Do not grant the destination's default ServiceAccount broad access as a shortcut.
-Quota/admission, storage cloning and guest boot still require a controlled live
-acceptance test; RBAC checks alone do not prove provisioning will complete.
+Source DataSource/PVC checks and clone authorization still use the central
+identity in the real source namespace. Do not grant the target's default SA
+broad access. Quota/admission, storage and guest boot still need live tests.
 
-## Boundaries and failure behavior
+## Boundaries and recovery
 
-The central SA gets only VM get/create plus dependency reads in each enrolled
-target. It cannot create namespaces, grant roles, install NADs or copy Secrets.
-Preflight validates the namespace, checks target permissions, local NAD and
-instance types, and duplicate VM/root-disk names before calling Infoblox.
-It freezes the validated destination in the workspace; creation uses that
-snapshot, not a later site ConfigMap value. Network snapshots remain unchanged.
+The central SA gets only VM get/create plus dependency reads in enrolled targets.
+It cannot create namespaces, roles, NADs or Secrets. Preflight checks permissions,
+NAD/instance types and duplicate VM/root-disk names before IPAM. The target and
+selected network settings are frozen for the request, not changed mid-run.
 
-This is for **trusted platform operators**, not a multi-tenant authorization
-portal. A requester able to use the central pipeline can select any target the
-central SA is allowed to manage. There is no impersonation of the human caller.
-RBAC grants to the central SA determine allowed targets; review its existing
-permissions and do not add cluster-admin. Arbitrary TaskRun/Pod creation in the
-execution namespace can expose credentials, as before.
-
-Failure does not trigger automatic retries, namespace creation, record deletion
-or VM cleanup. Keep the request logs and reconcile any reserved IPs after errors.
-Keep all pending network profiles disabled until their Infoblox settings are ready.
+This is for trusted platform operators, not multi-tenant authorization. Anyone
+with request access can choose targets permitted to the central SA; human
+identity is not impersonated. Arbitrary central Pod/TaskRun rights expose
+credentials. Never grant cluster-admin to the provisioning SA.
+No automatic retries, rollback, records/disks deletion or namespace creation.
+Preserve logs and reconcile uncertain IPAM writes before another request.
+Keep unapproved profiles disabled.
 
 References:
 - https://kubernetes.io/docs/reference/access-authn-authz/rbac/

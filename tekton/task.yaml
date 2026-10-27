@@ -63,6 +63,8 @@ spec:
       script: |
         #!/usr/bin/env sh
         set -eu
+        # Refuse the older DNS-enabled helper before any allocation.
+        test "$(python3 /opt/vm/ipam.py --version)" = "vm-ipam 0.4: IPAM-only subnet allocation"
         python3 /opt/vm/ipam.py check-ssh-key
     - name: preflight
       image: $(params.cli-image)
@@ -129,23 +131,16 @@ spec:
           [[ ! -e "$SCRATCH/network.env" ]] || fail "network snapshot already exists; do not retry automatically"
           umask 077
           : > "$SCRATCH/network.env.tmp"
-          for key in NETWORK_ATTACHMENT INFOBLOX_NETWORK INFOBLOX_NETWORK_VIEW INFOBLOX_DNS_VIEW STATIC_START STATIC_END GATEWAY DNS_SERVERS DOMAIN DHCP_START DHCP_END DHCP_DISABLED; do
+          for key in NETWORK_ATTACHMENT INFOBLOX_ALLOCATION_MODE INFOBLOX_NETWORK INFOBLOX_NETWORK_VIEW GATEWAY DNS_SERVERS DOMAIN; do
             value=$(cat "$profile/$key") || fail "network profile is missing $key"
             [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *REPLACE_ME* ]] || fail "invalid or placeholder network setting: $key"
-            case "$key" in
-              DHCP_START|DHCP_END) ;;
-              *) [[ -n "$value" ]] || fail "empty network setting: $key" ;;
-            esac
+            [[ -n "$value" ]] || fail "empty network setting: $key"
             # Literal data, never shell source; unknown keys cannot override namespaces.
             printf '%s=%s\n' "$key" "$value" >> "$SCRATCH/network.env.tmp"
             export "$key=$value"
           done
           [[ "$NETWORK_ATTACHMENT" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ && ${#NETWORK_ATTACHMENT} -le 63 ]] || fail "invalid profile NAD name"
-          case "$DHCP_DISABLED" in
-            true) [[ -z "$DHCP_START" && -z "$DHCP_END" ]] || fail "disabled DHCP conflicts with configured range" ;;
-            false) [[ -n "$DHCP_START" && -n "$DHCP_END" ]] || fail "DHCP range is required" ;;
-            *) fail "DHCP_DISABLED must be true or false" ;;
-          esac
+          [[ "$INFOBLOX_ALLOCATION_MODE" == subnet ]] || fail "approve subnet allocation before enabling this profile"
           mv "$SCRATCH/network.env.tmp" "$SCRATCH/network.env"
         elif [[ "${NETWORK_PROFILE_BOUND:-false}" != false ]]; then
           fail "invalid network workspace state"

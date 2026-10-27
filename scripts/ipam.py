@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Infoblox NIOS WAPI allocation for VM requests; Python standard library only.
+"""NIOS IPAM-only host allocation. Standard library; Python 3.9+.
 
-Writes a recovery receipt, not VM YAML. No retries, rollback, or guest credentials.
-Use check-ssh-key for offline SSH validation without contacting IPAM.
+Allocate from an approved subnet in one host POST, then verify the returned
+record. DNS/DHCP and MAC registration stay disabled. No automatic retries.
 """
 from __future__ import annotations
 
@@ -20,10 +20,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+VERSION = "0.4"
 HOST = re.compile(r"^[a-z][a-z0-9-]{0,61}[a-z0-9]$")
 DOMAIN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
 WAPI_VERSION = re.compile(r"^v?([0-9]{1,3}\.[0-9]{1,3}(?:\.[0-9]{1,3})?)$")
-HOST_REF = re.compile(r"^record:host/[A-Za-z0-9_.:/-]{1,300}$")
+# IPAM-only host references can end in /%20. Keep encoded bytes unchanged.
+HOST_REF = re.compile(r"^record:host/(?:[A-Za-z0-9_.:/-]|%[0-9A-Fa-f]{2}){1,1024}$")
+READ_FIELDS = "name,network_view,configure_for_dns,ipv4addrs"
 ED25519_PREFIX = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32)
 
 
@@ -72,25 +75,22 @@ def ipv4(value):
         if not isinstance(value, str):
             raise ValueError
         address = ipaddress.ip_address(value)
-        if address.version != 4:
+        if (address.version != 4 or address.is_unspecified or address.is_multicast
+                or address.is_loopback or str(address) == "255.255.255.255"):
             raise ValueError
         return address
     except (ValueError, TypeError):
-        raise AllocationError("Invalid IPv4 address") from None
+        raise AllocationError("Invalid unicast IPv4 address") from None
 
 
-def network_settings(prefix, gateway, dns, domain, start, end, dhcp_start="", dhcp_end=""):
+def network_settings(prefix, gateway, dns, domain):
     try:
         net = ipaddress.ip_network(prefix, strict=True)
     except (ValueError, TypeError):
         raise AllocationError("Invalid network prefix") from None
-    if net.version != 4 or net.num_addresses < 8:
-        raise AllocationError("A usable IPv4 network is required")
-    first, last, gw = ipv4(start), ipv4(end), ipv4(gateway)
-    if not net.network_address < first <= last < net.broadcast_address:
-        raise AllocationError("Static pool is outside network or includes reserved addresses")
-    if first == net.network_address + 1 and last == net.broadcast_address - 1:
-        raise AllocationError("Refusing whole-subnet allocation")
+    if net.version != 4 or not 1 <= net.prefixlen <= 30:
+        raise AllocationError("An IPv4 subnet with /1 through /30 prefix is required")
+    gw = ipv4(gateway)
     if (not isinstance(dns, str) or not isinstance(domain, str) or len(domain) > 253
             or not DOMAIN.fullmatch(domain)):
         raise AllocationError("Invalid DNS configuration")
@@ -100,19 +100,7 @@ def network_settings(prefix, gateway, dns, domain, start, end, dhcp_start="", dh
         raise AllocationError("Invalid DNS server address")
     if gw not in net or gw in edges:
         raise AllocationError("Gateway must be a usable address in the network")
-    if any(first <= x <= last for x in [gw, *servers]):
-        raise AllocationError("Static pool overlaps gateway or DNS")
-    if dhcp_start or dhcp_end:
-        if not dhcp_start or not dhcp_end:
-            raise AllocationError("Incomplete DHCP range")
-        ds, de = ipv4(dhcp_start), ipv4(dhcp_end)
-        if (not net.network_address < ds <= de < net.broadcast_address
-                or ds <= last and de >= first):
-            raise AllocationError("Static pool overlaps DHCP or DHCP is invalid")
-        if any(ds <= x <= de for x in [gw, *servers]):
-            raise AllocationError("DHCP pool overlaps gateway or DNS")
-    return dict(net=net, start=str(first), end=str(last), gateway=str(gw),
-                dns=",".join(map(str, servers)), domain=domain, dhcp=bool(dhcp_start))
+    return dict(net=net, gateway=str(gw), dns=",".join(map(str, servers)), domain=domain)
 
 
 def request(base, method, path, data=None, *, user, password):
@@ -134,10 +122,20 @@ def request(base, method, path, data=None, *, user, password):
         raise AllocationError("Invalid JSON response from IPAM") from None
 
 
+def validate_names(names):
+    if (not names or len(names) > 5 or len(set(names)) != len(names)
+            or not all(isinstance(x, str) and HOST.fullmatch(x) for x in names)):
+        raise AllocationError("Invalid, empty or duplicate VM names")
+
+
 def infoblox_preflight(names):
+    validate_names(names)
+    # Explicit migration gate: never silently broaden the old start/end policy.
+    if required("INFOBLOX_ALLOCATION_MODE") != "subnet":
+        raise AllocationError("INFOBLOX_ALLOCATION_MODE must be subnet; approve subnet-wide allocation first")
     version = WAPI_VERSION.fullmatch(required("INFOBLOX_WAPI_VERSION"))
     if not version:
-        raise AllocationError("INFOBLOX_WAPI_VERSION must look like 2.12 or v2.12")
+        raise AllocationError("INFOBLOX_WAPI_VERSION must look like 2.13.6 or v2.13.6")
     origin = required("IPAM_URL").rstrip("/")
     parts = urllib.parse.urlsplit(origin)
     if (parts.scheme != "https" or not parts.hostname or parts.username or parts.password
@@ -145,74 +143,89 @@ def infoblox_preflight(names):
         raise AllocationError("IPAM_URL must be an HTTPS origin without path or credentials")
     base = origin + "/wapi/v" + version.group(1)
     user, password = required("INFOBLOX_USERNAME"), required("INFOBLOX_PASSWORD")
-    view, network_view = required("INFOBLOX_DNS_VIEW"), required("INFOBLOX_NETWORK_VIEW")
-    if any(not s.isprintable() or s != s.strip() for s in (view, network_view)) or "," in network_view:
-        raise AllocationError("Invalid Infoblox view name")
-    settings = network_settings(
-        required("INFOBLOX_NETWORK"), required("GATEWAY"), required("DNS_SERVERS"),
-        required("DOMAIN"), required("STATIC_START"), required("STATIC_END"),
-        os.environ.get("DHCP_START", ""), os.environ.get("DHCP_END", ""))
-    disabled = os.environ.get("DHCP_DISABLED", "false")
-    if disabled not in ("true", "false") or settings["dhcp"] and disabled == "true":
-        raise AllocationError("DHCP_DISABLED must be true or false and must not conflict with a DHCP range")
-    if not settings["dhcp"] and disabled != "true":
-        raise AllocationError("Set DHCP_START and DHCP_END, or explicitly set DHCP_DISABLED=true")
-    settings["network_view"] = network_view
+    view = required("INFOBLOX_NETWORK_VIEW")
+    if not view.isprintable() or view != view.strip() or "," in view:
+        raise AllocationError("Invalid Infoblox network view name")
+    settings = network_settings(required("INFOBLOX_NETWORK"), required("GATEWAY"),
+                                required("DNS_SERVERS"), required("DOMAIN"))
 
     def call(method, path, body=None):
         return request(base, method, path, body, user=user, password=password)
 
     for name in names:
-        hostname = name + "." + settings["domain"]
-        if len(hostname) > 253:
-            raise AllocationError("VM FQDN is too long")
-        query = urllib.parse.urlencode({"name": hostname, "view": view})
+        if len(name + "." + settings["domain"]) > 253:
+            raise AllocationError("Guest FQDN is too long")
+        # Short name + network view, not FQDN + DNS view. Exactly the tested lookup.
+        query = urllib.parse.urlencode({"name": name, "network_view": view})
         found = call("GET", "record:host?" + query)
         if not isinstance(found, list):
             raise AllocationError("Unexpected Infoblox host search response shape")
         if found:
-            raise AllocationError(f"Host {hostname} already exists in Infoblox")
+            raise AllocationError(f"Host {name} already exists in Infoblox network view {view}")
     return call, settings, view
 
 
+def valid_host_ref(ref):
+    if not isinstance(ref, str) or not HOST_REF.fullmatch(ref):
+        return False
+    decoded = urllib.parse.unquote(ref)
+    return (all(c.isprintable() for c in decoded) and "\\" not in decoded
+            and not any(part in (".", "..") for part in decoded.split("/")))
+
+
 def infoblox_allocate(call, settings, view, name, mac):
-    fqdn = name + "." + settings["domain"]
-    network_view = settings["network_view"]
-    # Reserve through one server-side host insertion. No client-side free-IP scan.
+    # One server-side host insertion; no client-side free-IP scan or separate range.
+    print(f"ALLOCATING host={name} network={settings['net']} network-view={view} guest-mac={mac}", flush=True)
     ref = call("POST", "record:host", {
-        "name": fqdn, "view": view, "network_view": network_view,
-        "configure_for_dns": True,
+        "name": name,
+        "network_view": view,
+        "configure_for_dns": False,
         "ipv4addrs": [{
-            "ipv4addr": f'func:nextavailableip:{settings["start"]}-{settings["end"]},{network_view}'
+            "ipv4addr": f'func:nextavailableip:{settings["net"]},{view}',
+            "configure_for_dhcp": False,
         }],
     })
-    if not isinstance(ref, str) or not HOST_REF.fullmatch(ref):
-        raise AllocationError(f"Host {fqdn} may exist; inspect the DNS/network view before retrying")
-    print(f"RESERVED host={fqdn} mac={mac} dns-view={view} network-view={network_view}", flush=True)
-    obj = call("GET", ref + "?_return_fields=ipv4addrs")
-    addrs = obj.get("ipv4addrs") if isinstance(obj, dict) else None
+    if not valid_host_ref(ref):
+        raise AllocationError(f"Host {name} may exist; inspect the network view before retrying")
+    print(f"RESERVED host={name} ref={ref} guest-mac={mac}", flush=True)
+    # Preserve /%20 verbatim. Decoding or quoting again breaks the returned reference.
+    obj = call("GET", ref + "?_return_fields=" + READ_FIELDS)
+    if (not isinstance(obj, dict) or obj.get("name") != name
+            or obj.get("network_view") != view or obj.get("configure_for_dns") is not False):
+        raise AllocationError(f"Host {name} exists but readback identity/DNS settings differ; reconcile manually")
+    addrs = obj.get("ipv4addrs")
     if not isinstance(addrs, list) or len(addrs) != 1 or not isinstance(addrs[0], dict):
-        raise AllocationError(f"Host {fqdn} exists but its address response is invalid; reconcile manually")
+        raise AllocationError(f"Host {name} exists but its address response is invalid; reconcile manually")
+    if addrs[0].get("configure_for_dhcp") is not False:
+        raise AllocationError(f"Host {name} exists but DHCP is not explicitly disabled; reconcile manually")
     address = ipv4(addrs[0].get("ipv4addr"))
-    if not ipv4(settings["start"]) <= address <= ipv4(settings["end"]):
-        raise AllocationError(f"Host {fqdn} exists but its address is outside the pool; reconcile manually")
-    # DNS host record only: no DHCP fixed address or MAC registration in Infoblox.
-    return f'{address}/{settings["net"].prefixlen}'
+    net = settings["net"]
+    infrastructure = [ipv4(settings["gateway"]), *map(ipv4, settings["dns"].split(","))]
+    if (address not in net or address in (net.network_address, net.broadcast_address)
+            or address in infrastructure):
+        raise AllocationError(f"Host {name} exists but allocated an invalid/infrastructure IP; reconcile manually")
+    # MAC is for the VM only. Gateway, DNS and prefix remain administrator-supplied.
+    return f'{address}/{net.prefixlen}'
 
 
 def main(argv=()):
+    if list(argv) == ["--version"]:
+        print(f"vm-ipam {VERSION}: IPAM-only subnet allocation")
+        return
     if list(argv) == ["check-ssh-key"]:
         validate_ssh_key(required("REQ_SSH_KEY"))
         print("SSH public key format OK")
         return
+    if len(argv) == 2 and argv[0] == "check-ipam":
+        infoblox_preflight([argv[1]])
+        print("IPAM read-only checks passed; no IP allocated")
+        return
     if argv:
-        raise AllocationError("Unknown command; use no arguments or check-ssh-key")
+        raise AllocationError("Use check-ssh-key, check-ipam VM_NAME, --version, or no arguments to allocate")
     names = Path(required("VM_NAMES_FILE")).read_text().splitlines()
-    if not names or len(names) > 5 or len(set(names)) != len(names) or not all(HOST.fullmatch(x) for x in names):
-        raise AllocationError("Invalid, empty or duplicate VM names")
+    validate_names(names)
     output = Path(required("ALLOCATIONS_FILE"))
     output.parent.mkdir(parents=True, exist_ok=True)
-    # Exclusive creation prevents a second invocation from discarding a recovery receipt.
     with output.open("x", encoding="utf-8") as receipt:
         call, settings, view = infoblox_preflight(names)
         seen = set()
@@ -224,8 +237,7 @@ def main(argv=()):
                 if address in seen:
                     raise AllocationError(f"Duplicate allocated address for {name}; inspect both host records")
                 seen.add(address)
-                record = [name, cidr, mac, settings["gateway"], settings["dns"], settings["domain"]]
-                receipt.write("|".join(record) + "\n")
+                receipt.write("|".join([name, cidr, mac, settings["gateway"], settings["dns"], settings["domain"]]) + "\n")
                 receipt.flush()
                 print(f"Reserved {name} -> {cidr}", flush=True)
             except Exception as exc:
