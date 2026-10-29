@@ -100,7 +100,7 @@ objects:
         required: true
       - name: SSH_PUBLIC_KEY
         displayName: SSH public key
-        description: An OpenSSH ed25519 public key for the existing approved guest account.
+        description: One OpenSSH Ed25519 or RSA public key (RSA at least 2048 bits) for the existing guest account. Public key only; used for every VM in the request.
         required: true
       - name: VM_LABELS
         displayName: Additional VM labels

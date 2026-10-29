@@ -18,7 +18,7 @@ spec:
       description: Number of VMs (1-5); batches have numbered suffixes
     - name: ssh-public-key
       type: string
-      description: OpenSSH ed25519 public key
+      description: OpenSSH Ed25519 or RSA public key (RSA at least 2048 bits); one key for all VMs in the request.
     - name: vm-labels
       type: string
       default: ""

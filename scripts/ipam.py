@@ -54,19 +54,59 @@ def describe(exc):
 
 
 def validate_ssh_key(value):
-    if (not isinstance(value, str) or len(value) > 1024 or value != value.strip()
-            or not all(c.isprintable() for c in value)):
-        raise AllocationError("SSH public key must be one printable line")
+    """Validate one bare OpenSSH key; preserve its text and optional comment.
+
+    RSA's ssh-rsa key format does not require SHA-1 signatures (RFC 8332).
+    This validates encoding/size, not key ownership or the guest's SSH policy.
+    """
+    if (not isinstance(value, str) or not value or len(value) > 8192
+            or value != value.strip() or not all(c.isprintable() for c in value)):
+        raise AllocationError("SSH public key must be one printable line (maximum 8192 characters)")
     parts = value.split(" ", 2)
-    if len(parts) < 2 or parts[0] != "ssh-ed25519":
-        raise AllocationError("SSH ed25519 public key required")
+    if len(parts) < 2 or parts[0] not in ("ssh-ed25519", "ssh-rsa"):
+        raise AllocationError("SSH public key must be Ed25519 or RSA (at least 2048 bits)")
     try:
         blob = base64.b64decode(parts[1], validate=True)
     except (binascii.Error, ValueError):
         raise AllocationError("SSH public key is not valid base64") from None
-    if (base64.b64encode(blob).decode() != parts[1] or len(blob) != 51
-            or not blob.startswith(ED25519_PREFIX)):
-        raise AllocationError("SSH public key is not a valid ed25519 key")
+    if base64.b64encode(blob).decode() != parts[1]:
+        raise AllocationError("SSH public key is not canonical base64")
+    if parts[0] == "ssh-ed25519":
+        if len(blob) != 51 or not blob.startswith(ED25519_PREFIX):
+            raise AllocationError("SSH public key is not a valid ed25519 key")
+        return value
+
+    # RFC 4253 RSA blob: string 'ssh-rsa', positive mpint exponent, mpint modulus.
+    offset = 0
+
+    def field():
+        nonlocal offset
+        if offset + 4 > len(blob):
+            raise AllocationError("Truncated RSA public key")
+        length = struct.unpack_from(">I", blob, offset)[0]
+        offset += 4
+        if length > len(blob) - offset:
+            raise AllocationError("Truncated RSA public key")
+        result = blob[offset:offset + length]
+        offset += length
+        return result
+
+    def positive_mpint():
+        raw = field()
+        if (not raw or raw[0] & 0x80
+                or raw[0] == 0 and (len(raw) == 1 or not raw[1] & 0x80)):
+            raise AllocationError("RSA public key has an invalid positive integer")
+        return int.from_bytes(raw, "big")
+
+    if field() != b"ssh-rsa":
+        raise AllocationError("SSH public key type does not match its encoded data")
+    exponent, modulus = positive_mpint(), positive_mpint()
+    if offset != len(blob):
+        raise AllocationError("RSA public key has trailing data")
+    if exponent < 3 or exponent % 2 == 0 or exponent >= modulus or modulus % 2 == 0:
+        raise AllocationError("RSA public key has invalid exponent or modulus")
+    if modulus.bit_length() < 2048:
+        raise AllocationError("RSA public key must be at least 2048 bits")
     return value
 
 
